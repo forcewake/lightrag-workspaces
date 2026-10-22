@@ -1,6 +1,7 @@
 """Offline migration contracts independent of a PostgreSQL service/provider."""
 import argparse
 import base64
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -12,7 +13,7 @@ import uuid
 import numpy as np
 
 from migrate_postgres import (
-    Migration, archive_payload, batches, cache_records, classify_source_files, file_manifest,
+    Migration, archive_payload, batches, cache_records, chunk_document_memberships, classify_source_files, file_manifest,
     graph_records, iter_object, preserve_backlog, project, timestamp, vector_tables,
     validate_control_root, validate_report_path, workspace_namespace,
 )
@@ -220,6 +221,129 @@ class MigrationContractTests(unittest.TestCase):
             validate_report_path(source, alias / "report.json")
         validate_report_path(source, self.root / "outside.json")
         validate_report_path(source, None)
+
+    def test_shared_chunks_retain_kv_owner_and_all_status_memberships(self):
+        chunks = [{"id": "shared", "full_doc_id": "kv-owner"}, {"id": "legacy", "full_doc_id": None}]
+        statuses = [{"id": "doc-a", "chunks_list": '["shared","legacy"]'},
+                    {"id": "doc-b", "chunks_list": ["shared", "shared"]}]
+        before = copy.deepcopy((chunks, statuses))
+        expected = {"shared": {"kv-owner", "doc-a", "doc-b"}, "legacy": {"doc-a"}}
+        self.assertEqual(chunk_document_memberships(chunks, statuses), expected)
+        self.assertEqual(chunk_document_memberships(reversed(chunks), reversed(statuses)), expected)
+        self.assertEqual((chunks, statuses), before)
+
+
+class _RecoveryTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _RecoveryDatabase:
+    """In-memory storage boundary; production reconstruction code runs unchanged."""
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self.source_chunks = [{"id": "shared", "full_doc_id": "doc-a"}]
+        self.statuses = [{"id": "doc-a", "chunks_list": ["shared"]},
+                         {"id": "doc-b", "chunks_list": '["shared"]'}]
+        self.originals = {("full_entities", "doc-a"), ("full_relations", "doc-a"),
+                          ("entity_chunks", "A"), ("relation_chunks", "A<SEP>B")}
+        self.storage = {}
+        self.writes = 0
+
+    def transaction(self):
+        return _RecoveryTransaction()
+
+    async def fetch(self, query, *args):
+        if "FROM lightrag_doc_chunks" in query:
+            return self.source_chunks
+        if "FROM lightrag_doc_full" in query:
+            return [{"id": "doc-a"}, {"id": "doc-b"}]
+        if "FROM lightrag_doc_status" in query:
+            return ([{"id": "doc-a"}, {"id": "doc-b"}] if "status='processed'" in query else self.statuses)
+        if "FROM lightrag_workspace_archive" in query:
+            _, namespace, keys = args
+            return [{"id": key} for key in keys if (namespace, key) in self.originals]
+        raise AssertionError("Unexpected storage read: " + query)
+
+    def cursor(self, query, *args, **kwargs):
+        async def records():
+            if "lightrag_graph_nodes" in query:
+                for key in ("A", "B"):
+                    yield {"id": key, "properties": json.dumps({"source_id": "shared"})}
+            elif "lightrag_graph_edges" in query:
+                yield {"src_id": "A", "tgt_id": "B", "properties": {"source_id": "shared"}}
+            else:
+                raise AssertionError("Unexpected graph read")
+        return records()
+
+    async def execute(self, query, *args):
+        if not query.startswith("DELETE FROM "):
+            raise AssertionError("Unexpected storage write")
+        table = query.split()[2]
+        for key in args[1]:
+            self.storage.pop((table, key), None)
+        self.writes += 1
+
+
+class _RecoveryMigration(Migration):
+    async def copy(self, table, rows):
+        for row in rows:
+            self.db.storage[(table, row["id"])] = copy.deepcopy(row)
+        self.db.writes += 1
+
+    async def verify_rows(self, table, rows):
+        for row in rows:
+            if self.db.storage.get((table, row["id"])) != row:
+                raise AssertionError("Recovery readback mismatch")
+
+
+class SharedChunkRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_anchors_are_rebuilt_for_every_document_sharing_a_chunk(self):
+        workspace = workspace_namespace("fixture")
+        args = argparse.Namespace(embedding_model="model", embedding_dim=3072,
+            target_database="fixture", target_token=str(uuid.uuid4()), batch_size=2)
+        migration = _RecoveryMigration(args)
+        migration.db = database = _RecoveryDatabase(workspace)
+        database.originals.clear()
+        report = await migration.recovery_anchors(workspace, verify=False)
+        for document in ("doc-a", "doc-b"):
+            self.assertEqual(database.storage[("lightrag_full_entities", document)]["entity_names"], ["A", "B"])
+            self.assertEqual(database.storage[("lightrag_full_relations", document)]["relation_pairs"], [["A", "B"]])
+        self.assertEqual(report["full_entities"], 2)
+        self.assertEqual(report["full_relations"], 2)
+        self.assertEqual(report["_warnings"]["source_chunks_shared_between_documents"], 1)
+
+    async def test_rebuild_all_document_memberships_and_preserve_authoritative_anchors(self):
+        workspace = workspace_namespace("fixture")
+        args = argparse.Namespace(embedding_model="model", embedding_dim=3072,
+            target_database="fixture", target_token=str(uuid.uuid4()), batch_size=2)
+        migration = _RecoveryMigration(args)
+        migration.db = database = _RecoveryDatabase(workspace)
+        originals = {
+            ("lightrag_full_entities", "doc-a"): project("full_entities", "doc-a", {"entity_names": ["authoritative"], "count": 1}, workspace),
+            ("lightrag_full_relations", "doc-a"): project("full_relations", "doc-a", {"relation_pairs": [["kept", "pair"]], "count": 1}, workspace),
+            ("lightrag_entity_chunks", "A"): project("entity_chunks", "A", {"chunk_ids": ["shared", "preserved-extra"], "count": 2}, workspace),
+            ("lightrag_relation_chunks", "A<SEP>B"): project("relation_chunks", "A<SEP>B", {"chunk_ids": ["shared", "preserved-extra"], "count": 2}, workspace),
+        }
+        database.storage.update(copy.deepcopy(originals))
+        original_source = copy.deepcopy((database.source_chunks, database.statuses))
+        report = await migration.recovery_anchors(workspace, verify=False)
+        self.assertEqual(database.storage[("lightrag_full_entities", "doc-b")]["entity_names"], ["A", "B"])
+        self.assertEqual(database.storage[("lightrag_full_relations", "doc-b")]["relation_pairs"], [["A", "B"]])
+        self.assertEqual(report["full_entities"], 1)
+        self.assertEqual(report["full_relations"], 1)
+        self.assertEqual(report["_warnings"]["source_chunks_shared_between_documents"], 1)
+        self.assertEqual(report["_warnings"]["orphan_source_chunk_refs"], 0)
+        for key, row in originals.items():
+            self.assertEqual(database.storage[key], row)
+        self.assertEqual((database.source_chunks, database.statuses), original_source)
+        # The complete checkpoint can be verified again without rewriting rows.
+        writes = database.writes
+        self.assertEqual(await migration.recovery_anchors(workspace, verify=True), report)
+        self.assertEqual(database.writes, writes)
 
 
 if __name__ == "__main__":

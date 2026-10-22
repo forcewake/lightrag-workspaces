@@ -56,6 +56,24 @@ def preserve_backlog(status_counts: Iterable[dict]) -> bool:
     return any(row["status"] in BACKLOG_STATUSES and row["count"] > 0 for row in status_counts)
 
 
+def chunk_document_memberships(source_chunks: Iterable[dict], status_rows: Iterable[dict]) -> dict[str, set[str]]:
+    """Retain every document membership of a content-addressed chunk.
+
+    A chunk KV row has one full_doc_id, while multiple document status records
+    may legitimately reference that same chunk ID. Neither source overwrites
+    the other when reconstructing the document-level recovery indexes.
+    """
+    memberships: dict[str, set[str]] = {}
+    for row in source_chunks:
+        if row["full_doc_id"]:
+            memberships.setdefault(row["id"], set()).add(row["full_doc_id"])
+    for row in status_rows:
+        values = json.loads(row["chunks_list"]) if isinstance(row["chunks_list"], str) else row["chunks_list"]
+        for chunk in values or []:
+            memberships.setdefault(chunk, set()).add(row["id"])
+    return memberships
+
+
 def dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -661,16 +679,12 @@ class Migration:
         async with self.db.transaction():
             source_chunks = await self.db.fetch("SELECT id,full_doc_id FROM lightrag_doc_chunks WHERE workspace=$1", workspace)
             source_chunk_ids = {row["id"] for row in source_chunks}
-            mapping = {r["id"]: r["full_doc_id"] for r in source_chunks if r["full_doc_id"]}
             full_doc_ids = {row["id"] for row in await self.db.fetch("SELECT id FROM lightrag_doc_full WHERE workspace=$1", workspace)}
-            for row in await self.db.fetch("SELECT id,chunks_list FROM lightrag_doc_status WHERE workspace=$1", workspace):
-                values = json.loads(row["chunks_list"]) if isinstance(row["chunks_list"], str) else row["chunks_list"]
-                for chunk in values or []:
-                    if chunk in mapping and mapping[chunk] != row["id"]:
-                        raise ValueError("Conflicting chunk/document provenance")
-                    mapping[chunk] = row["id"]
+            status_rows = await self.db.fetch("SELECT id,chunks_list FROM lightrag_doc_status WHERE workspace=$1", workspace)
+            mapping = chunk_document_memberships(source_chunks, status_rows)
             warnings["source_chunks_without_doc"] = len(source_chunk_ids - mapping.keys())
-            warnings["source_chunks_with_missing_full_doc"] = sum(doc not in full_doc_ids for chunk, doc in mapping.items() if chunk in source_chunk_ids)
+            warnings["source_chunks_with_missing_full_doc"] = sum(any(doc not in full_doc_ids for doc in docs) for chunk, docs in mapping.items() if chunk in source_chunk_ids)
+            warnings["source_chunks_shared_between_documents"] = sum(len(docs) > 1 for chunk, docs in mapping.items() if chunk in source_chunk_ids)
             for kind in ("nodes", "edges"):
                 query = f"SELECT * FROM lightrag_graph_{kind} WHERE workspace=$1"
                 pending = []
@@ -687,13 +701,13 @@ class Migration:
                     if kind == "nodes":
                         namespace, key = "entity_chunks", row["id"]
                         for chunk in chunk_ids:
-                            if chunk in mapping:
-                                doc_entities.setdefault(mapping[chunk], set()).add(key)
+                            for doc in mapping.get(chunk, ()):
+                                doc_entities.setdefault(doc, set()).add(key)
                     else:
                         namespace, key = "relation_chunks", SEP.join((row["src_id"], row["tgt_id"]))
                         for chunk in chunk_ids:
-                            if chunk in mapping:
-                                doc_relations.setdefault(mapping[chunk], set()).add((row["src_id"], row["tgt_id"]))
+                            for doc in mapping.get(chunk, ()):
+                                doc_relations.setdefault(doc, set()).add((row["src_id"], row["tgt_id"]))
                     if chunk_ids:
                         pending.append((key, {"chunk_ids": chunk_ids, "count": len(chunk_ids)}))
                     if len(pending) >= self.args.batch_size:
@@ -857,10 +871,10 @@ class Migration:
             raise ValueError("Archive contains missing or unexpected source records")
         verification = {"source_unchanged": True, "native_rows_read_back": True, "archive_rows_read_back": True,
             "float32_bits_verified": True, "archive_records": archive_count, "derived_anchors": derived,
-            "provider_calls": 0, "statuses": {row["status"]: row["count"] for row in statuses}}
+            "recovery_membership_version": 2, "provider_calls": 0, "statuses": {row["status"]: row["count"] for row in statuses}}
         verification["retained_source_only_files"] = retained_source_only
         self.report["workspaces"][public_id] = {"postgres_workspace": workspace, "source_manifest_sha256": before["sha256"], "counts": counts, "preserve_backlog": bool(backlog), "verification": verification, "vector_tables": dict(self.tables)}
-        if not verify:
+        if self.args.action == "apply":
             await self.db.execute("UPDATE lightrag_workspace_registry SET counts=$2,verification=$3 WHERE workspace=$1", public_id, dumps(counts), dumps(verification))
         print(dumps({"workspace": public_id, "phase": "verified", "counts": counts}), flush=True)
 
