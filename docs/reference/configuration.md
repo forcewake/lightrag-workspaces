@@ -11,6 +11,7 @@ Copy `.env.example` to `.env` and keep it private. Compose reads host options fr
 | `LIGHTRAG_MEMORY_LIMIT` | `8g` | Compose container hard memory ceiling; size for your corpora |
 | `LIGHTRAG_STORAGE_BACKEND` | `file` | `file` or `postgres`; use the explicit migration procedure before changing |
 | `LIGHTRAG_DEFAULT_WORKSPACE` | `default` | Existing corpus used when no selector is supplied |
+| `LIGHTRAG_LEGACY_STORAGE_WORKSPACE` | Configured default | Stable owner of pre-workspace browser history/settings; pin the original default before changing the routing default |
 | `LIGHTRAG_MAX_ACTIVE_WORKSPACES` | `2` | Maximum resident workers; memory admission can allow fewer |
 | `LIGHTRAG_WORKSPACE_STARTUP_TIMEOUT` | `240` | Maximum seconds to wait for a cold worker to become healthy |
 | `LIGHTRAG_WORKSPACE_IDLE_SECONDS` | `600` | Idle seconds before a worker becomes eligible for retirement |
@@ -23,6 +24,19 @@ Copy `.env.example` to `.env` and keep it private. Compose reads host options fr
 The startup deadline defaults to **240 seconds**, and idle retirement defaults to **600 seconds**. A worker must also pass the idle check before retirement; elapsed time alone does not override active work.
 
 `LIGHTRAG_WORKER_BUDGET_DIVISOR` is internal: the gateway sets it from the worker-pool limit. Worker-level `WORKSPACE`, `POSTGRES_WORKSPACE`, `WORKING_DIR`, `INPUT_DIR`, `HOST`, `PORT`, `WORKERS`, `LOG_DIR`, and `LIGHTRAG_API_PREFIX` are set internally for each selected corpus. Do not use upstream `WORKSPACE` or `POSTGRES_WORKSPACE` as an alternative per-request selector.
+
+## Change the default workspace
+
+Choose an existing exact workspace ID. Before changing an installation's default, set `LIGHTRAG_LEGACY_STORAGE_WORKSPACE` to its **original default** and keep that value stable:
+
+```dotenv
+LIGHTRAG_LEGACY_STORAGE_WORKSPACE=default
+LIGHTRAG_DEFAULT_WORKSPACE=meeting-notes
+```
+
+Recreate the container, then open `/webui/`. UI and API requests without a workspace selector use `meeting-notes`; explicit URLs and `LIGHTRAG-WORKSPACE` headers retain their selection. Browser conversations and settings keep their existing keys: `default` still owns the legacy keys, while `meeting-notes` keeps its namespaced keys. No corpus is renamed or migrated. Existing tabs with an explicit workspace URL keep that workspace.
+
+When `LIGHTRAG_LEGACY_STORAGE_WORKSPACE` is unset, it follows the configured default for compatibility with existing installations. It identifies browser storage only; it does not grant access or select a database namespace. See also the [Russian instructions](../getting-started/quickstart.ru.md#change-default).
 
 ## Provider identity
 

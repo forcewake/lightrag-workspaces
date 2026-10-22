@@ -43,6 +43,19 @@ curl http://localhost:9621/workspaces/research/query \
 
 Альтернатива: обычный `/query` с заголовком `LIGHTRAG-WORKSPACE: research`. Без выбора используется `LIGHTRAG_DEFAULT_WORKSPACE`. Swagger выбранной базы — `/workspaces/research/docs`. При включённой аутентификации передавайте ключ или bearer-токен. [Все примеры API](../guides/api.md).
 
+## Изменить базу по умолчанию { #change-default }
+
+Выберите существующий точный идентификатор базы. Перед изменением default закрепите прежний default в `LIGHTRAG_LEGACY_STORAGE_WORKSPACE` и больше не меняйте это значение:
+
+```dotenv
+LIGHTRAG_LEGACY_STORAGE_WORKSPACE=default
+LIGHTRAG_DEFAULT_WORKSPACE=meeting-notes
+```
+
+Пересоздайте контейнер и откройте `/webui/`. Интерфейс и API без выбора используют `meeting-notes`. Явные URL и заголовки `LIGHTRAG-WORKSPACE` сохраняют свой выбор; открытые вкладки с таким URL остаются в прежней базе.
+
+История и настройки браузера остаются привязаны к своим базам: `default` сохраняет прежние общие ключи, а `meeting-notes` — свои отдельные ключи. Серверные документы не перемещаются и не переименовываются. Если `LIGHTRAG_LEGACY_STORAGE_WORKSPACE` не задан, он совпадает с default для совместимости со старыми установками. [Полная конфигурация](../reference/configuration.md#change-the-default-workspace).
+
 ## Существующие данные
 
 Остановите старый сервис, сделайте проверенную резервную копию и сначала испытайте расширение на копии данных. Не переименовывайте папки, не меняйте модели и не запускайте двух писателей на одном индексе.

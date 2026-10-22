@@ -195,6 +195,26 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(response.json()["workspace_header"])
                 self.assertEqual(self.manager.leases[-1], expected)
 
+    async def test_new_default_routes_requests_without_reassigning_legacy_browser_state(self):
+        self.config.default_workspace = "meeting-notes"
+        self.config.legacy_storage_workspace = "default"
+        discovery = await self.client.get("/workspaces")
+        self.assertEqual(discovery.json()["defaultWorkspace"], "meeting-notes")
+        redirect = await self.client.get("/webui/")
+        self.assertEqual(redirect.headers["location"], "/workspaces/meeting-notes/webui/")
+        html = (await self.client.get(redirect.headers["location"])).text
+        runtime = json.loads(html.split("window.__LIGHTRAG_CONFIG__=", 1)[1].split(";</script>", 1)[0])
+        self.assertEqual(runtime["workspaceId"], "meeting-notes")
+        self.assertEqual(runtime["defaultWorkspace"], "meeting-notes")
+        self.assertEqual(runtime["legacyStorageWorkspace"], "default")
+        for path, headers, expected in (
+            ("/health", {}, "meeting-notes"),
+            ("/health", {"LIGHTRAG-WORKSPACE": "default"}, "default"),
+            ("/workspaces/default/health", {}, "default"),
+        ):
+            response = await self.client.get(path, headers=headers)
+            self.assertEqual(response.json()["workspace"], expected)
+
     async def test_invalid_explicit_selector_never_falls_back_or_leases(self):
         cases = (
             ("/health", [("LIGHTRAG-WORKSPACE", "")]),
