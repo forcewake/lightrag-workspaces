@@ -16,6 +16,14 @@ The tests cover routing, invalid selectors, leases and streaming cleanup, idle e
 
 The exact pinned Docker image remains the deployment oracle for upstream compatibility; a local Python test alone does not prove a new upstream release works.
 
+The native Markdown header hook also has a no-network runtime check:
+
+```sh
+python scripts/smoke_table_headers.py --engine docker --image lightrag-workspaces:local
+```
+
+It uses the built image's packaged hook and real pinned parser, sidecar writer and paragraph chunker with synthetic Markdown/HTML. It checks small, header-only, repeated-value and oversized tables, token bounds and provenance without model calls or production mounts. `--module-file table_headers.py` is available to test a local hook against an older pinned image; only the command without that override verifies packaging in the new image.
+
 ## Frontend source
 
 `frontend.patch` applies to upstream source commit `28ff1b05f2ac3f3e6fa14dd2cd33656579bd0c9c` (LightRAG 1.5.7). Use Bun **1.3.3** for the pinned frontend build.

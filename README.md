@@ -69,6 +69,7 @@ An old unfinished import queue makes that workspace read-only for changes; compa
 | Area | Supported here |
 | --- | --- |
 | Upstream | LightRAG **1.5.7**, source and base image pinned |
+| Native Markdown tables | Literal column headers included before chunking and embedding since **0.2.2**; existing indexes require an explicit reindex |
 | File storage | `JsonKVStorage`, `JsonDocStatusStorage`, `NanoVectorDBStorage`, `NetworkXStorage` |
 | PostgreSQL storage | `PGKVStorage`, `PGDocStatusStorage`, `PGVectorStorage` with `VCHORDRQ`, `PGTableGraphStorage` |
 | Deployment | One gateway process; one local worker process per active corpus |

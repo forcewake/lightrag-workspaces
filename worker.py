@@ -34,6 +34,7 @@ from postgres_backend import (
     POSTGRES_STORAGES, configure_postgres_workspace, install_postgres_vector_namespace, selected_backend,
     validate_postgres_readiness,
 )
+from table_headers import install_table_header_preservation
 
 
 WORKSPACE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
@@ -495,6 +496,7 @@ def run_worker(args: argparse.Namespace) -> None:
         # LightRAG initializes its own parser lazily. Do not feed it our argv.
         sys.argv = ["lightrag-server"]
         install_startup_preservation(file_backends=backend == "file")
+        install_table_header_preservation()
         if backend == "file":
             install_bounded_nano_loader()
         else:

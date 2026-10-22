@@ -1,6 +1,20 @@
 # Configure file processing
 
-The extension routes files to the selected workspace. Parsing and indexing are provided by the pinned LightRAG 1.5.7 server; this project does not add a separate parser implementation.
+The extension routes files to the selected workspace. Parsing and indexing use the pinned LightRAG 1.5.7 server. A small compatibility hook preserves native Markdown table headers in the text passed to the upstream indexer.
+
+## Search table column labels
+
+Since extension **0.2.2**, native Markdown pipe-table headers are included before the sidecar writer computes document/block hashes and before the paragraph chunker counts tokens. Column labels therefore enter ordinary searchable chunks as literal source text. They also reach table analysis when it is enabled; search does not rely on an LLM repeating the labels in its description.
+
+The structured `table_header` metadata is retained. Small tables and tables with no data rows keep their headers. When an oversized table is split by rows, the upstream chunker repeats the header in each slice within its token budget. A header or single row larger than that budget uses the upstream text-splitting fallback; its complete text can span several chunks. HTML tables retain their existing `<thead>`, `rowspan` and `colspan` representation.
+
+The hook supports the exact pinned Markdown adapter only and refuses source/version drift. It changes future native parsing for both file and PostgreSQL workspaces. It does not alter the legacy parser or other document adapters.
+
+### Existing indexed documents
+
+Updating the application does **not** rewrite existing documents, chunks or embeddings. Existing table headers remain in their native sidecars until an explicit reindex operation includes them in searchable content.
+
+Before repairing an existing corpus, back up its inputs, sidecars and affected stored rows, including vectors. Test on a disposable copy. A repair must update both searchable chunk text and its embedding, retain source/provenance and workspace ownership, and verify literal labels after retrieval. Changing metadata alone or appending text without recalculating the embedding does not repair vector search. This release does not run an automatic backfill at worker startup.
 
 ## Choose the parser deliberately
 
