@@ -1,0 +1,15 @@
+name: Feature request
+description: Describe a use case or improvement.
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What would you like to do?
+      description: Describe the problem and the behavior you want. Use synthetic examples.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and constraints
+      description: Include compatibility, resource, or data-preservation requirements if relevant.

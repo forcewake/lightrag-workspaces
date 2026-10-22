@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://forcewake.github.io/lightrag-workspaces/
+    about: Installation, API usage, Unraid, backups, and troubleshooting.
+  - name: Security reporting
+    url: https://github.com/forcewake/lightrag-workspaces/security/policy
+    about: Report sensitive security problems privately.

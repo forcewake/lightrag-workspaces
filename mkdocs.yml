@@ -1,0 +1,75 @@
+site_name: LightRAG Workspaces
+site_description: One interface and API address for separate LightRAG corpora.
+site_url: https://forcewake.github.io/lightrag-workspaces/
+repo_url: https://github.com/forcewake/lightrag-workspaces
+repo_name: forcewake/lightrag-workspaces
+edit_uri: edit/main/docs/
+copyright: Community extension · Built on HKUDS/LightRAG
+strict: true
+exclude_docs: |
+  /README.md
+theme:
+  name: material
+  language: en
+  logo: assets/mark.svg
+  favicon: assets/mark.svg
+  font: false
+  palette:
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - toc:
+      permalink: true
+extra_css:
+  - stylesheets/extra.css
+nav:
+  - Overview: index.md
+  - Start here:
+      - Install with Docker Compose: getting-started/installation.md
+      - First workspace: getting-started/first-workspace.md
+      - Русский быстрый старт: getting-started/quickstart.ru.md
+  - Use it:
+      - Browser interface: guides/interface.md
+      - API and streaming: guides/api.md
+      - File processing: guides/file-processing.md
+  - Bring existing data:
+      - Adopt an installation: guides/existing-data.md
+      - Unraid: guides/unraid.md
+      - Backup and rollback: guides/backup-and-rollback.md
+  - Operate:
+      - Configuration: reference/configuration.md
+      - Architecture and limits: reference/architecture.md
+      - Troubleshooting: reference/troubleshooting.md
+  - Develop:
+      - Development: development.md
+      - Release checklist: releasing.md
+  - Credits: credits.md

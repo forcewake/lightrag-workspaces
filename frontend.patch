@@ -1,0 +1,1626 @@
+diff --git a/lightrag_webui/src/App.tsx b/lightrag_webui/src/App.tsx
+index 7068c52..dda1247 100644
+--- a/lightrag_webui/src/App.tsx
++++ b/lightrag_webui/src/App.tsx
+@@ -19,6 +19,9 @@ import {
+ import SiteHeader from '@/features/SiteHeader'
+ import { InvalidApiKeyError, RequireApiKeError } from '@/api/lightrag'
+ import { ZapIcon } from 'lucide-react'
++import WorkspaceOpening from '@/components/WorkspaceOpening'
++import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
++import { isWorkspaceBootstrapError, type WorkspaceBootstrapError } from '@/api/errors'
+ 
+ import GraphViewer from '@/features/GraphViewer'
+ import DocumentManager from '@/features/DocumentManager'
+@@ -34,12 +37,14 @@ function App() {
+   const currentTab = useSettingsStore.use.currentTab()
+   const [apiKeyAlertOpen, setApiKeyAlertOpen] = useState(false)
+   const [initializing, setInitializing] = useState(true) // Add initializing state
++  const [workspaceError, setWorkspaceError] = useState<WorkspaceBootstrapError | null>(null)
+   // Bumped by the cross-tab identity watch: remounting the retrieval view
+   // drops the live session state that belonged to the previous identity.
+   const identityEpoch = useIdentityEpochStore((s) => s.epoch)
+   const versionCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
+   const healthCheckInitializedRef = useRef(false); // Prevent duplicate health checks in Vite dev mode
+   const pageRestoreGeneration = usePageRestoreGeneration()
++  const gatewayWorkspaceId = getRuntimeWorkspaceConfig()?.workspaceId
+ 
+   const handleApiKeyAlertOpenChange = useCallback((open: boolean) => {
+     setApiKeyAlertOpen(open)
+@@ -64,6 +69,9 @@ function App() {
+ 
+   // Health check - can be disabled
+   useEffect(() => {
++    // Auth bootstrap already waits for the cold worker. Starting a short
++    // health poll before that finishes would briefly report it as offline.
++    if (gatewayWorkspaceId && (initializing || workspaceError)) return
+     // Health check function
+     const performHealthCheck = async () => {
+       try {
+@@ -104,7 +112,7 @@ function App() {
+     return () => {
+       useBackendState.getState().clearHealthCheckTimer();
+     };
+-  }, [enableHealthCheck, apiKeyAlertOpen, pageRestoreGeneration]);
++  }, [enableHealthCheck, apiKeyAlertOpen, pageRestoreGeneration, gatewayWorkspaceId, initializing, workspaceError]);
+ 
+   // Version check - independent and executed only once
+   useEffect(() => {
+@@ -158,6 +166,7 @@ function App() {
+         markVersionCheckedFromLogin();
+       } catch (error) {
+         console.error('Failed to get version info:', error);
++        if (isWorkspaceBootstrapError(error)) setWorkspaceError(error)
+       } finally {
+         // Ensure initializing is set to false even if there's an error
+         setInitializing(false);
+@@ -186,7 +195,7 @@ function App() {
+   return (
+     <ThemeProvider>
+       <TabVisibilityProvider>
+-        {initializing ? (
++        {workspaceError ? <WorkspaceOpening error={workspaceError} /> : initializing ? getRuntimeWorkspaceConfig() ? <WorkspaceOpening /> : (
+           // Loading state while initializing with simplified header
+           <div className="flex h-screen w-screen flex-col">
+             {/* Simplified header during initialization - matches SiteHeader structure */}
+diff --git a/lightrag_webui/src/api/errors.ts b/lightrag_webui/src/api/errors.ts
+index d88c7d7..67dcc14 100644
+--- a/lightrag_webui/src/api/errors.ts
++++ b/lightrag_webui/src/api/errors.ts
+@@ -25,3 +25,19 @@ export function isAuthenticationRequiredError(
+     (error instanceof Error && error.name === 'AuthenticationRequiredError')
+   )
+ }
++
++/** Opening a corpus failed; this says nothing about whether sign-in is required. */
++export class WorkspaceBootstrapError extends Error {
++  constructor(
++    public readonly reason: 'unavailable' | 'timeout' | 'network' | 'invalid_response',
++    public readonly status?: number
++  ) {
++    super('Workspace could not be opened')
++    this.name = 'WorkspaceBootstrapError'
++  }
++}
++
++export function isWorkspaceBootstrapError(error: unknown): error is WorkspaceBootstrapError {
++  return error instanceof WorkspaceBootstrapError ||
++    (error instanceof Error && error.name === 'WorkspaceBootstrapError')
++}
+diff --git a/lightrag_webui/src/api/lightrag-stream.test.ts b/lightrag_webui/src/api/lightrag-stream.test.ts
+index e7f67f3..240622c 100644
+--- a/lightrag_webui/src/api/lightrag-stream.test.ts
++++ b/lightrag_webui/src/api/lightrag-stream.test.ts
+@@ -1,4 +1,5 @@
+ import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test'
++import axios from 'axios'
+ // Dependency-free module — safe to import statically before the mocks below.
+ import { isAuthenticationRequiredError } from './errors'
+ 
+@@ -36,10 +37,9 @@ Object.defineProperty(globalThis, 'sessionStorage', {
+ // - navigationService.navigateToUnauthenticated is neutralized with a
+ //   RESTORABLE spy (mockRestore in afterAll) so the 401 paths under test
+ //   don't navigate, while later files still see the real service.
+-// The remaining mock.module targets are leaf-ish dependencies where an
+-// overlay is sufficient: '@/lib/constants' (spread-real, pins the base URL)
+-// and 'axios' (feeds the guest-token refresh; api/lightrag is imported
+-// dynamically AFTER this mock so its axios instance is the mocked one).
++// Only the spread-real constants overlay below remains a module mock. Axios
++// must stay real so later API tests can exercise its instance interceptors;
++// guest-token refresh uses a restorable spy on axios.get instead.
+ // An OVERLAY on the real module, not a replacement. `mock.module` is global for
+ // the whole `bun test` run and is never undone, so a factory returning only the
+ // three exports this file needs also deletes every OTHER export of that module
+@@ -56,36 +56,6 @@ mock.module('@/lib/constants', () => ({
+   searchLabelsDefaultLimit: 50,
+ }))
+ 
+-// Mock axios — the module calls axios.create() at top level and
+-// axios.get() in silentRefreshGuestToken
+-mock.module('axios', () => {
+-  const instance = {
+-    get: () =>
+-      Promise.resolve({
+-        data: {
+-          access_token: 'mock-guest-token',
+-          auth_configured: false,
+-          core_version: '1.0',
+-          api_version: '1.0',
+-        },
+-        headers: {},
+-      }),
+-    post: () => Promise.resolve({ data: {}, headers: {} }),
+-    interceptors: {
+-      request: { use: () => {} },
+-      response: { use: () => {} },
+-    },
+-  }
+-  // The default export from axios is the main axios function, which also has
+-  // .create, .get, .post, etc. as static methods.
+-  const axiosFn: any = () => Promise.resolve({ data: {}, headers: {} })
+-  axiosFn.create = () => instance
+-  axiosFn.get = instance.get
+-  axiosFn.post = instance.post
+-  axiosFn.interceptors = instance.interceptors
+-  return { default: axiosFn, __esModule: true }
+-})
+-
+ // ---------------------------------------------------------------------------
+ // Helpers
+ // ---------------------------------------------------------------------------
+@@ -149,14 +119,23 @@ let authStore: typeof import('@/stores/state').useAuthStore
+ let restoreMocks: (() => void) | undefined
+ 
+ beforeAll(async () => {
+-  // Dynamic imports AFTER the axios/constants mocks above, so the api module's
+-  // axios instance is the mocked one. These are the REAL store and navigation
+-  // modules — see the isolation note at the top of this file.
++  // Use the real axios instance and interceptors regardless of test-file order.
++  // Only the standalone guest-token request is stubbed and restored below.
+   settingsStore = (await import('@/stores/settings')).useSettingsStore
+   authStore = (await import('@/stores/state')).useAuthStore
+   const { navigationService } = await import('@/services/navigation')
+   apiModule = await import('./lightrag')
+ 
++  const axiosGetSpy = spyOn(axios, 'get').mockResolvedValue({
++    data: {
++      access_token: 'mock-guest-token',
++      auth_configured: false,
++      core_version: '1.0',
++      api_version: '1.0',
++    },
++    headers: {},
++  })
++
+   // Restorable, not module-level: the 401 paths under test call this; a
+   // module mock would leak a no-op service into every later test file.
+   const navSpy = spyOn(navigationService, 'navigateToUnauthenticated')
+@@ -164,6 +143,7 @@ beforeAll(async () => {
+   const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+   const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+   restoreMocks = () => {
++    axiosGetSpy.mockRestore()
+     navSpy.mockRestore()
+     errorSpy.mockRestore()
+     warnSpy.mockRestore()
+diff --git a/lightrag_webui/src/api/lightrag.test.ts b/lightrag_webui/src/api/lightrag.test.ts
+index 890fcbd..1fb6fe3 100644
+--- a/lightrag_webui/src/api/lightrag.test.ts
++++ b/lightrag_webui/src/api/lightrag.test.ts
+@@ -366,3 +366,105 @@ describe('ai content notice flag', () => {
+     expect(useAiContentNoticeStore.getState().enabled).toBe(true)
+   })
+ })
++
++describe('cold workspace auth bootstrap', () => {
++  test('waits for gateway startup while preserving the stock five-second bound', async () => {
++    const previousConfig = window.__LIGHTRAG_CONFIG__
++    const timeouts: number[] = []
++    apiModule.__setAxiosAdapterForTests(async (config: any) => {
++      expect(config.url).toBe('/auth-status')
++      timeouts.push(config.timeout)
++      return {
++        data: { auth_configured: false, access_token: 'guest-token', auth_mode: 'disabled' },
++        status: 200,
++        statusText: 'OK',
++        headers: { 'content-type': 'application/json' },
++        config
++      }
++    })
++    try {
++      window.__LIGHTRAG_CONFIG__ = {
++        workspaceId: 'research',
++        defaultWorkspace: 'default',
++        workspaces: [{ id: 'research', documents: 1, processed: 1, pending: 0, processing: 0, failed: 0, readOnly: false }]
++      }
++      const gatewayStatus = await apiModule.getAuthStatus()
++      expect(gatewayStatus.auth_configured).toBe(false)
++      expect(gatewayStatus.access_token).toBe('guest-token')
++      window.__LIGHTRAG_CONFIG__ = {}
++      const stockStatus = await apiModule.getAuthStatus()
++      expect(stockStatus.auth_configured).toBe(false)
++      expect(timeouts).toEqual([240000, 5000])
++    } finally {
++      window.__LIGHTRAG_CONFIG__ = previousConfig
++      apiModule.__setAxiosAdapterForTests(undefined)
++    }
++  })
++
++  for (const status of [409, 503]) {
++    test(`gateway HTTP ${status} is an opening failure, not a sign-in requirement`, async () => {
++      const previousConfig = window.__LIGHTRAG_CONFIG__
++      window.__LIGHTRAG_CONFIG__ = {
++        workspaceId: 'research',
++        workspaces: [{ id: 'research', documents: 1, processed: 1, pending: 0, processing: 0, failed: 0, readOnly: false }]
++      }
++      apiModule.__setAxiosAdapterForTests(async (config: any) => {
++        throw { response: { status, statusText: 'Unavailable', data: {} }, config }
++      })
++      try {
++        const { WorkspaceBootstrapError } = await import('@/api/errors')
++        const failure = await apiModule.getAuthStatus().then(() => null, (error) => error)
++        expect(failure).toBeInstanceOf(WorkspaceBootstrapError)
++        expect(failure.status).toBe(status)
++        expect(failure.reason).toBe('unavailable')
++      } finally {
++        window.__LIGHTRAG_CONFIG__ = previousConfig
++        apiModule.__setAxiosAdapterForTests(undefined)
++      }
++    })
++  }
++
++  test('gateway timeout and network errors remain opening failures', async () => {
++    const previousConfig = window.__LIGHTRAG_CONFIG__
++    window.__LIGHTRAG_CONFIG__ = {
++      workspaceId: 'research',
++      workspaces: [{ id: 'research', documents: 1, processed: 1, pending: 0, processing: 0, failed: 0, readOnly: false }]
++    }
++    try {
++      const { WorkspaceBootstrapError } = await import('@/api/errors')
++      for (const [error, reason] of [
++        [Object.assign(new Error('timeout'), { code: 'ECONNABORTED' }), 'timeout'],
++        [new Error('Network Error'), 'network']
++      ] as const) {
++        apiModule.__setAxiosAdapterForTests(async () => { throw error })
++        const failure = await apiModule.getAuthStatus().then(() => null, (value) => value)
++        expect(failure).toBeInstanceOf(WorkspaceBootstrapError)
++        expect(failure.reason).toBe(reason)
++      }
++    } finally {
++      window.__LIGHTRAG_CONFIG__ = previousConfig
++      apiModule.__setAxiosAdapterForTests(undefined)
++    }
++  })
++
++  test('real authentication failures and stock deployment failures keep their existing auth path', async () => {
++    const previousConfig = window.__LIGHTRAG_CONFIG__
++    try {
++      const { AuthenticationRequiredError } = await import('@/api/errors')
++      window.__LIGHTRAG_CONFIG__ = {
++        workspaceId: 'research',
++        workspaces: [{ id: 'research', documents: 1, processed: 1, pending: 0, processing: 0, failed: 0, readOnly: false }]
++      }
++      for (const error of [new AuthenticationRequiredError(), apiModule.toHttpRequestError(403, 'Forbidden', {})]) {
++        apiModule.__setAxiosAdapterForTests(async () => { throw error })
++        expect((await apiModule.getAuthStatus()).auth_configured).toBe(true)
++      }
++      window.__LIGHTRAG_CONFIG__ = {}
++      apiModule.__setAxiosAdapterForTests(async () => { throw new Error('Network Error') })
++      expect((await apiModule.getAuthStatus()).auth_configured).toBe(true)
++    } finally {
++      window.__LIGHTRAG_CONFIG__ = previousConfig
++      apiModule.__setAxiosAdapterForTests(undefined)
++    }
++  })
++})
+diff --git a/lightrag_webui/src/api/lightrag.ts b/lightrag_webui/src/api/lightrag.ts
+index 27982d8..4ec7c65 100644
+--- a/lightrag_webui/src/api/lightrag.ts
++++ b/lightrag_webui/src/api/lightrag.ts
+@@ -14,7 +14,8 @@ import { useSettingsStore } from '@/stores/settings'
+ import { useAuthStore } from '@/stores/state'
+ import { applyAiContentNoticeFlag } from '@/stores/aiContentNotice'
+ import { navigationService } from '@/services/navigation'
+-import { AuthenticationRequiredError, isAuthenticationRequiredError } from '@/api/errors'
++import { AuthenticationRequiredError, isAuthenticationRequiredError, WorkspaceBootstrapError, isWorkspaceBootstrapError } from '@/api/errors'
++import { getRuntimeAuthTimeoutMs, getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
+ 
+ // Types
+ export type LightragNodeType = {
+@@ -1062,9 +1063,10 @@ export const deleteDocuments = async (
+ 
+ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
+   try {
+-    // Add a timeout to the request to prevent hanging
++    // The gateway may be opening a cold corpus. Wait for its bounded startup
++    // rather than misclassifying a slow auth-disabled worker as a login page.
+     const response = await axiosInstance.get('/auth-status', {
+-      timeout: 5000, // 5 second timeout
++      timeout: getRuntimeAuthTimeoutMs(),
+       headers: {
+         'Accept': 'application/json' // Explicitly request JSON
+       }
+@@ -1075,6 +1077,7 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
+     const contentType = typeof contentTypeHeader === 'string' ? contentTypeHeader : '';
+     if (contentType.includes('text/html')) {
+       console.warn('Received HTML response instead of JSON for auth-status endpoint');
++      if (getRuntimeWorkspaceConfig()) throw new WorkspaceBootstrapError('invalid_response')
+       return {
+         auth_configured: true,
+         auth_mode: 'enabled'
+@@ -1109,14 +1112,28 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
+     // If response data is invalid but we got a response, log it
+     console.warn('Received invalid auth status response:', response.data);
+ 
++    if (getRuntimeWorkspaceConfig()) throw new WorkspaceBootstrapError('invalid_response')
++
+     // Default to auth configured if response is invalid
+     return {
+       auth_configured: true,
+       auth_mode: 'enabled'
+     };
+   } catch (error) {
+-    // If the request fails, assume authentication is configured
+     console.error('Failed to get auth status:', errorMessage(error));
++    if (getRuntimeWorkspaceConfig()) {
++      if (isWorkspaceBootstrapError(error)) throw error
++      const failure = error as { status?: number; code?: string; message?: string }
++      // Authentication failures retain the existing sign-in/API-key path.
++      // Availability failures must never manufacture a credential prompt.
++      if (!isAuthenticationRequiredError(error) && failure.status !== 401 && failure.status !== 403) {
++        const reason = failure.code === 'ECONNABORTED' || failure.code === 'ETIMEDOUT' || /timeout/i.test(failure.message || '')
++          ? 'timeout'
++          : failure.status ? 'unavailable' : 'network'
++        throw new WorkspaceBootstrapError(reason, failure.status)
++      }
++    }
++    // Preserve the stock deployment fallback and real authentication failures.
+     return {
+       auth_configured: true,
+       auth_mode: 'enabled'
+diff --git a/lightrag_webui/src/components/WorkspaceOpening.test.tsx b/lightrag_webui/src/components/WorkspaceOpening.test.tsx
+new file mode 100644
+index 0000000..5d4493a
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceOpening.test.tsx
+@@ -0,0 +1,64 @@
++import { afterEach, describe, expect, spyOn, test } from 'bun:test'
++import { cleanup, screen } from '@testing-library/react'
++import userEvent from '@testing-library/user-event'
++import { renderWithProviders } from '@/test/render'
++import WorkspaceOpening from './WorkspaceOpening'
++import { WorkspaceBootstrapError } from '@/api/errors'
++
++const originalConfig = window.__LIGHTRAG_CONFIG__
++const originalUrl = window.location.href
++
++afterEach(() => {
++  cleanup()
++  window.__LIGHTRAG_CONFIG__ = originalConfig
++  window.history.replaceState(null, '', originalUrl)
++})
++
++describe('opening a cold workspace', () => {
++  test('names the workspace and lets the user switch away before startup finishes', async () => {
++    window.__LIGHTRAG_CONFIG__ = {
++      workspaceId: 'research',
++      workspaces: ['research', 'default'].map((id) => ({ id, documents: 1, processed: 1, failed: 0, pending: 0, processing: 0, readOnly: false }))
++    }
++    window.history.replaceState(null, '', '/workspaces/research/webui/')
++    const assign = spyOn(window.location, 'assign').mockImplementation(() => {})
++    try {
++      const user = userEvent.setup()
++      renderWithProviders(<WorkspaceOpening />)
++      expect(screen.getByRole('status')).toHaveTextContent('Opening workspace research…')
++      expect(screen.getByRole('status')).toHaveTextContent('while your documents load')
++      expect(screen.queryAllByRole('textbox', { name: /username/i })).toHaveLength(0)
++      await user.selectOptions(screen.getByRole('combobox', { name: 'Workspace' }), 'default')
++      expect(assign).toHaveBeenCalledWith('/workspaces/default/webui/')
++    } finally {
++      assign.mockRestore()
++    }
++  })
++
++  test('leaves the ordinary deployment bootstrap presentation unchanged', () => {
++    window.__LIGHTRAG_CONFIG__ = {}
++    renderWithProviders(<WorkspaceOpening />)
++    expect(screen.queryAllByRole('status')).toHaveLength(0)
++    expect(screen.queryAllByRole('combobox')).toHaveLength(0)
++  })
++
++  test('an unavailable workspace shows its reason, retry and selector without credentials', async () => {
++    window.__LIGHTRAG_CONFIG__ = {
++      workspaceId: 'research',
++      workspaces: [{ id: 'research', documents: 1, processed: 1, failed: 0, pending: 0, processing: 0, readOnly: true, readOnlyReason: 'These documents need their original model settings.' }]
++    }
++    const reload = spyOn(window.location, 'reload').mockImplementation(() => {})
++    try {
++      const user = userEvent.setup()
++      renderWithProviders(<WorkspaceOpening error={new WorkspaceBootstrapError('unavailable', 409)} />)
++      expect(screen.getByRole('alert')).toHaveTextContent('Could not open workspace research')
++      expect(screen.getByRole('alert')).toHaveTextContent('These documents need their original model settings.')
++      expect(screen.getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
++      expect(screen.queryAllByRole('textbox')).toHaveLength(0)
++      await user.click(screen.getByRole('button', { name: 'Try again' }))
++      expect(reload).toHaveBeenCalledTimes(1)
++    } finally {
++      reload.mockRestore()
++    }
++  })
++})
+diff --git a/lightrag_webui/src/components/WorkspaceOpening.tsx b/lightrag_webui/src/components/WorkspaceOpening.tsx
+new file mode 100644
+index 0000000..be751a3
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceOpening.tsx
+@@ -0,0 +1,71 @@
++import { useTranslation } from 'react-i18next'
++import { ZapIcon } from 'lucide-react'
++import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
++import WorkspaceSelector from './WorkspaceSelector'
++import WorkspaceReadOnlyNotice from './WorkspaceReadOnlyNotice'
++import type { WorkspaceBootstrapError } from '@/api/errors'
++import Button from '@/components/ui/Button'
++
++interface WorkspaceOpeningProps {
++  error?: WorkspaceBootstrapError | null
++}
++
++/** A loading explanation shared by both entries; never changes auth decisions. */
++export function WorkspaceOpeningStatus({ error }: WorkspaceOpeningProps) {
++  const { t } = useTranslation()
++  const config = getRuntimeWorkspaceConfig()
++  if (config && error) {
++    const workspace = config.workspaces.find((item) => item.id === config.workspaceId)
++    const explanation = error.status === 409 && workspace?.readOnlyReason
++      ? workspace.readOnlyReason
++      : t(`workspace.switcher.openingError.${error.reason}`, {
++        defaultValue: 'The workspace is unavailable. Try again or choose another workspace.'
++      })
++    return (
++      <div role="alert" className="flex max-w-md flex-col items-center gap-3 px-4 text-center">
++        <p className="text-sm font-medium">
++          {t('workspace.switcher.openingFailed', { defaultValue: 'Could not open workspace {{workspace}}', workspace: config.workspaceId })}
++        </p>
++        <p className="text-muted-foreground text-sm leading-relaxed">{explanation}</p>
++        <Button type="button" variant="outline" onClick={() => window.location.reload()}>
++          {t('workspace.switcher.retry', 'Try again')}
++        </Button>
++      </div>
++    )
++  }
++  return (
++    <div role="status" aria-label={config ? undefined : 'Loading'} className="flex flex-col items-center gap-3 px-4 text-center">
++      <div className="border-primary size-8 animate-spin rounded-full border-4 border-t-transparent" aria-hidden="true" />
++      {config && (
++        <>
++          <p className="text-sm font-medium">
++            {t('workspace.switcher.opening', { defaultValue: 'Opening workspace {{workspace}}…', workspace: config.workspaceId })}
++          </p>
++          <p className="text-muted-foreground max-w-sm text-xs leading-relaxed">
++            {t('workspace.switcher.firstVisit', 'The first visit can take a little longer while your documents load.')}
++          </p>
++        </>
++      )}
++    </div>
++  )
++}
++
++/** The selector stays available while a slow workspace opens. */
++export default function WorkspaceOpening({ error }: WorkspaceOpeningProps) {
++  if (!getRuntimeWorkspaceConfig()) return null
++  return (
++    <div className="bg-background flex h-dvh w-screen flex-col">
++      <header className="border-border/40 flex min-h-11 shrink-0 flex-wrap items-center gap-3 border-b px-4">
++        <span className="flex items-center gap-2 text-sm font-bold">
++          <ZapIcon className="size-4 text-emerald-400" aria-hidden="true" />
++          LightRAG
++        </span>
++        <WorkspaceSelector />
++      </header>
++      <WorkspaceReadOnlyNotice />
++      <div className="flex flex-1 items-center justify-center">
++        <WorkspaceOpeningStatus error={error} />
++      </div>
++    </div>
++  )
++}
+diff --git a/lightrag_webui/src/components/WorkspaceReadOnlyNotice.tsx b/lightrag_webui/src/components/WorkspaceReadOnlyNotice.tsx
+new file mode 100644
+index 0000000..1637d90
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceReadOnlyNotice.tsx
+@@ -0,0 +1,20 @@
++import { useTranslation } from 'react-i18next'
++import { LockKeyhole } from 'lucide-react'
++import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
++
++export default function WorkspaceReadOnlyNotice() {
++  const { t } = useTranslation()
++  const config = getRuntimeWorkspaceConfig()
++  const workspace = config?.workspaces.find((item) => item.id === config.workspaceId)
++  if (!workspace?.readOnly) return null
++
++  return (
++    <div role="status" className="flex shrink-0 items-start gap-2 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs leading-relaxed text-amber-950 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">
++      <LockKeyhole className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
++      <p>
++        <span className="font-medium">{workspace.id}: {t('workspace.switcher.readOnly', 'read only')}. </span>
++        {workspace.readOnlyReason || t('workspace.switcher.preservedNotice', 'Existing documents are preserved. Adding or changing documents is paused for this workspace.')}
++      </p>
++    </div>
++  )
++}
+diff --git a/lightrag_webui/src/components/WorkspaceSelector.test.tsx b/lightrag_webui/src/components/WorkspaceSelector.test.tsx
+new file mode 100644
+index 0000000..0927801
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceSelector.test.tsx
+@@ -0,0 +1,92 @@
++import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
++import { cleanup, screen } from '@testing-library/react'
++import userEvent from '@testing-library/user-event'
++import { renderWithProviders } from '@/test/render'
++import WorkspaceSelector from './WorkspaceSelector'
++import WorkspaceReadOnlyNotice from './WorkspaceReadOnlyNotice'
++import type { RuntimeWorkspace } from '@/lib/runtimeConfig'
++
++const originalConfig = window.__LIGHTRAG_CONFIG__
++const originalUrl = window.location.href
++const workspaces: RuntimeWorkspace[] = [
++  { id: 'default', documents: 24, processed: 22, failed: 2, pending: 0, processing: 0, readOnly: false },
++  { id: 'meeting-notes', documents: 221, processed: 0, failed: 0, pending: 220, processing: 1, readOnly: true }
++]
++let assign: ReturnType<typeof spyOn<typeof window.location, 'assign'>>
++
++beforeEach(() => {
++  window.__LIGHTRAG_CONFIG__ = { workspaceId: 'default', defaultWorkspace: 'default', workspaces }
++  window.history.replaceState(null, '', '/workspaces/default/webui/')
++  assign = spyOn(window.location, 'assign').mockImplementation(() => {})
++})
++
++afterEach(() => {
++  cleanup()
++  assign.mockRestore()
++  window.__LIGHTRAG_CONFIG__ = originalConfig
++  window.history.replaceState(null, '', originalUrl)
++})
++
++describe('workspace selector', () => {
++  test('has an accessible name, current selection, document counts and read-only state', () => {
++    renderWithProviders(<WorkspaceSelector />)
++    expect(screen.getByRole('combobox', { name: 'Workspace' })).toHaveValue('default')
++    expect(screen.getByRole('option', { name: 'default (24)' })).toBeInTheDocument()
++    expect(screen.getByRole('option', { name: 'meeting-notes (221) — read only' })).toBeInTheDocument()
++  })
++
++  test('switches the admin page by full navigation, keeping the exact workspace name', async () => {
++    const user = userEvent.setup()
++    renderWithProviders(<WorkspaceSelector />)
++    await user.selectOptions(screen.getByRole('combobox', { name: 'Workspace' }), 'meeting-notes')
++    expect(assign).toHaveBeenCalledTimes(1)
++    expect(assign).toHaveBeenCalledWith('/workspaces/meeting-notes/webui/')
++    // A selection in this tab does not modify the global configuration or a
++    // persisted choice that would silently retarget requests in another tab.
++    expect(window.__LIGHTRAG_CONFIG__?.workspaceId).toBe('default')
++  })
++
++  test('keeps the query-only entry when switching, without a previous chat route', async () => {
++    window.history.replaceState(null, '', '/workspaces/default/workspace/#/welcome')
++    const user = userEvent.setup()
++    renderWithProviders(<WorkspaceSelector />)
++    await user.selectOptions(screen.getByRole('combobox', { name: 'Workspace' }), 'meeting-notes')
++    expect(assign).toHaveBeenCalledWith('/workspaces/meeting-notes/workspace/')
++  })
++
++  test('does not navigate when selecting the current workspace', async () => {
++    const user = userEvent.setup()
++    renderWithProviders(<WorkspaceSelector />)
++    await user.selectOptions(screen.getByRole('combobox', { name: 'Workspace' }), 'default')
++    expect(assign).not.toHaveBeenCalled()
++  })
++
++  test('remains absent on an ordinary deployment without gateway metadata', () => {
++    window.__LIGHTRAG_CONFIG__ = {}
++    renderWithProviders(<WorkspaceSelector />)
++    expect(screen.queryAllByRole('combobox')).toHaveLength(0)
++  })
++})
++
++describe('preserved workspace notice', () => {
++  test('names the read-only workspace and explains that documents are preserved', () => {
++    window.__LIGHTRAG_CONFIG__!.workspaceId = 'meeting-notes'
++    renderWithProviders(<WorkspaceReadOnlyNotice />)
++    expect(screen.getByRole('status')).toHaveTextContent('meeting-notes: read only.')
++    expect(screen.getByRole('status')).toHaveTextContent('Existing documents are preserved.')
++  })
++
++  test('uses the supplied reason for incompatible workspaces', () => {
++    window.__LIGHTRAG_CONFIG__ = {
++      workspaceId: 'archive',
++      workspaces: [{ ...workspaces[1], id: 'archive', readOnlyReason: 'These documents need their original model settings before they can be used.' }]
++    }
++    renderWithProviders(<WorkspaceReadOnlyNotice />)
++    expect(screen.getByRole('status')).toHaveTextContent('These documents need their original model settings before they can be used.')
++  })
++
++  test('does not warn for a writable workspace', () => {
++    renderWithProviders(<WorkspaceReadOnlyNotice />)
++    expect(screen.queryAllByRole('status')).toHaveLength(0)
++  })
++})
+diff --git a/lightrag_webui/src/components/WorkspaceSelector.tsx b/lightrag_webui/src/components/WorkspaceSelector.tsx
+new file mode 100644
+index 0000000..d2b9724
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceSelector.tsx
+@@ -0,0 +1,44 @@
++import { useId } from 'react'
++import { useTranslation } from 'react-i18next'
++import { ChevronDown } from 'lucide-react'
++import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
++import { workspaceEntryPath } from '@/lib/workspaceRouting'
++
++export default function WorkspaceSelector() {
++  const { t } = useTranslation()
++  const id = useId()
++  const config = getRuntimeWorkspaceConfig()
++  if (!config) return null
++
++  const changeWorkspace = (workspaceId: string) => {
++    if (workspaceId === config.workspaceId) return
++    if (!config.workspaces.some((workspace) => workspace.id === workspaceId)) return
++    // Navigation destroys the old query, document and graph state. The URL,
++    // rather than a shared cookie or localStorage choice, keeps tabs isolated.
++    window.location.assign(workspaceEntryPath(workspaceId, window.location.pathname))
++  }
++
++  return (
++    <div className="flex min-w-0 items-center gap-2">
++      <label htmlFor={id} className="text-muted-foreground hidden text-xs lg:inline">
++        {t('workspace.switcher.label', 'Workspace')}
++      </label>
++      <div className="relative min-w-0">
++        <select
++          id={id}
++          aria-label={t('workspace.switcher.label', 'Workspace')}
++          value={config.workspaceId}
++          onChange={(event) => changeWorkspace(event.target.value)}
++          className="border-input bg-background text-foreground focus-visible:ring-ring h-8 max-w-[10rem] min-w-24 cursor-pointer appearance-none truncate rounded-md border py-1 pr-7 pl-2 text-xs focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none sm:max-w-[13rem]"
++        >
++          {config.workspaces.map((workspace) => (
++            <option key={workspace.id} value={workspace.id}>
++              {workspace.id} ({workspace.documents}){workspace.readOnly ? ` — ${t('workspace.switcher.readOnly', 'read only')}` : ''}
++            </option>
++          ))}
++        </select>
++        <ChevronDown className="text-muted-foreground pointer-events-none absolute top-2 right-2 size-4" aria-hidden="true" />
++      </div>
++    </div>
++  )
++}
+diff --git a/lightrag_webui/src/components/status/StatusCard.test.tsx b/lightrag_webui/src/components/status/StatusCard.test.tsx
+new file mode 100644
+index 0000000..08c0ef2
+--- /dev/null
++++ b/lightrag_webui/src/components/status/StatusCard.test.tsx
+@@ -0,0 +1,43 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++import { cleanup, screen } from '@testing-library/react'
++import { renderWithProviders } from '@/test/render'
++import type { LightragStatus } from '@/api/lightrag'
++import StatusCard from './StatusCard'
++
++const originalConfig = window.__LIGHTRAG_CONFIG__
++const status = {
++  input_directory: '/data/inputs/meeting-notes',
++  configuration: {
++    workspace: '',
++    force_llm_summary_on_merge: 8,
++    kv_storage: 'JsonKVStorage',
++    doc_status_storage: 'JsonDocStatusStorage',
++    vector_storage: 'NanoVectorDBStorage',
++    graph_storage: 'NetworkXStorage'
++  }
++} as unknown as LightragStatus
++
++afterEach(() => {
++  cleanup()
++  window.__LIGHTRAG_CONFIG__ = originalConfig
++})
++
++describe('gateway workspace identity in status', () => {
++  test('shows the canonical corpus while explaining that storage namespaces are unchanged', () => {
++    window.__LIGHTRAG_CONFIG__ = {
++      workspaceId: 'meeting-notes',
++      workspaces: [{ id: 'meeting-notes', documents: 1, processed: 1, failed: 0, pending: 0, processing: 0, readOnly: false }]
++    }
++    renderWithProviders(<StatusCard status={status} />)
++    expect(screen.getAllByRole('cell', { name: 'meeting-notes' })).toHaveLength(4)
++    expect(screen.getByText(/Saved storage namespaces are unchanged/)).toBeInTheDocument()
++    expect(status.configuration.workspace).toBe('')
++  })
++
++  test('retains backend-reported storage workspace names outside the gateway', () => {
++    window.__LIGHTRAG_CONFIG__ = {}
++    renderWithProviders(<StatusCard status={{ ...status, configuration: { ...status.configuration, workspace: 'original_namespace' } }} />)
++    expect(screen.getAllByRole('cell', { name: 'original_namespace' })).toHaveLength(4)
++    expect(screen.queryAllByText(/Saved storage namespaces are unchanged/)).toHaveLength(0)
++  })
++})
+diff --git a/lightrag_webui/src/components/status/StatusCard.tsx b/lightrag_webui/src/components/status/StatusCard.tsx
+index 4e19b57..f6338f0 100644
+--- a/lightrag_webui/src/components/status/StatusCard.tsx
++++ b/lightrag_webui/src/components/status/StatusCard.tsx
+@@ -4,6 +4,7 @@ import type {
+   LightragStatus
+ } from '@/api/lightrag'
+ import { useTranslation } from 'react-i18next'
++import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
+ import {
+   Table,
+   TableBody,
+@@ -154,6 +155,7 @@ const StatusCard = ({ status }: { status: LightragStatus | null }) => {
+   const roleRows = getModelRows(status)
+   const storageWorkspaces = status.configuration.storage_workspaces
+   const defaultWorkspace = status.configuration.workspace
++  const gatewayWorkspace = getRuntimeWorkspaceConfig()?.workspaceId
+   const storageColumns = [
+     {
+       key: 'kv',
+@@ -338,13 +340,18 @@ const StatusCard = ({ status }: { status: LightragStatus | null }) => {
+               <TableRow className="hover:bg-muted/30">
+                 {storageColumns.map(({ key, workspace }) => (
+                   <TableCell key={`${key}-workspace`} className="text-muted-foreground break-all px-2 py-1 align-top">
+-                    {textValue(workspace)}
++                    {textValue(gatewayWorkspace ?? workspace)}
+                   </TableCell>
+                 ))}
+               </TableRow>
+             </TableBody>
+           </Table>
+         </div>
++        {gatewayWorkspace && (
++          <p className="text-muted-foreground text-xs">
++            {t('workspace.switcher.storageIdentity', 'Workspace names identify the selected corpus. Saved storage namespaces are unchanged.')}
++          </p>
++        )}
+       </div>
+     </div>
+   )
+diff --git a/lightrag_webui/src/features/LoginPage.tsx b/lightrag_webui/src/features/LoginPage.tsx
+index c501083..1f7396f 100644
+--- a/lightrag_webui/src/features/LoginPage.tsx
++++ b/lightrag_webui/src/features/LoginPage.tsx
+@@ -4,6 +4,8 @@ import { useAuthStore } from '@/stores/state'
+ import { activateLoginIdentityFromToken } from '@/lib/loginIdentity'
+ import { markVersionCheckedFromLogin } from '@/lib/versionCheckCache'
+ import { loginToServer, getAuthStatus } from '@/api/lightrag'
++import WorkspaceOpening from '@/components/WorkspaceOpening'
++import { isWorkspaceBootstrapError, type WorkspaceBootstrapError } from '@/api/errors'
+ import { toast } from 'sonner'
+ import { useTranslation } from 'react-i18next'
+ import { Card, CardContent, CardHeader } from '@/components/ui/Card'
+@@ -50,6 +52,7 @@ const LoginPage = ({ autoActivateGuest = true }: LoginPageProps) => {
+   const [username, setUsername] = useState('')
+   const [password, setPassword] = useState('')
+   const [checkingAuth, setCheckingAuth] = useState(true)
++  const [workspaceError, setWorkspaceError] = useState<WorkspaceBootstrapError | null>(null)
+   const [authStatusTitle, setAuthStatusTitle] = useState<string | null>(null)
+   // The tick is stored WITH the document it was given for; a language switch
+   // replaces that document, and consent must not survive the swap.
+@@ -154,6 +157,7 @@ const LoginPage = ({ autoActivateGuest = true }: LoginPageProps) => {
+ 
+       } catch (error) {
+         console.error('Failed to check auth configuration:', error)
++        if (isWorkspaceBootstrapError(error)) setWorkspaceError(error)
+         // Also set checkingAuth to false in case of error
+         setCheckingAuth(false);
+       }
+@@ -174,8 +178,8 @@ const LoginPage = ({ autoActivateGuest = true }: LoginPageProps) => {
+   // until then, so a form rendered earlier would be submittable ungated on a
+   // deployment that requires the agreement. Both requests are in flight
+   // together, so on a reachable server this is the same single wait as before.
+-  if (checkingAuth || content.loading) {
+-    return null
++  if (workspaceError || checkingAuth || content.loading) {
++    return <WorkspaceOpening error={workspaceError} />
+   }
+ 
+   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+diff --git a/lightrag_webui/src/features/SiteHeader.tsx b/lightrag_webui/src/features/SiteHeader.tsx
+index dfb200a..8bff578 100644
+--- a/lightrag_webui/src/features/SiteHeader.tsx
++++ b/lightrag_webui/src/features/SiteHeader.tsx
+@@ -12,6 +12,8 @@ import { ZapIcon, LogOutIcon, BookOpenIcon } from 'lucide-react'
+ import GithubIcon from '@/components/icons/GithubIcon'
+ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
+ import TouchDescriptionPopover from '@/components/ui/TouchDescriptionPopover'
++import WorkspaceSelector from '@/components/WorkspaceSelector'
++import WorkspaceReadOnlyNotice from '@/components/WorkspaceReadOnlyNotice'
+ 
+ interface NavigationTabProps {
+   value: string
+@@ -80,87 +82,93 @@ export default function SiteHeader() {
+   }
+ 
+   return (
+-    <header className="border-border/40 bg-background/95 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50 flex h-10 w-full border-b px-4 backdrop-blur">
+-      <div className="min-w-[200px] w-auto flex items-center">
+-        {/* Document-relative brand link: under HashRouter the pathname always
++    <>
++      <header className="border-border/40 bg-background/95 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50 flex min-h-10 w-full shrink-0 flex-wrap gap-x-3 border-b px-4 backdrop-blur">
++        <div className="w-auto flex min-w-0 items-center">
++          {/* Document-relative brand link: under HashRouter the pathname always
+             names this entry, so this resolves back to THIS entry — never a
+             cross-entry jump, under any proxy prefix or the dev server's
+             file-per-entry layout (see entryHomeHref). */}
+-        <TooltipProvider>
+-          <Tooltip>
+-            <TooltipTrigger asChild>
+-              <a href={entryHomeHref(window.location.pathname)} className="flex items-center">
+-                <ZapIcon className="mr-2 size-4 text-emerald-400" aria-hidden="true" />
+-                <span className="font-bold md:inline-block">{SiteInfo.name}</span>
+-                {webuiTitle && (
+-                  <>
+-                    <span className="mx-1 text-xs text-gray-500 dark:text-gray-400" aria-hidden="true">|</span>
+-                    <span className="text-sm font-medium">{webuiTitle}</span>
+-                  </>
+-                )}
+-              </a>
+-            </TooltipTrigger>
+-            {webuiDescription && (
+-              <TooltipContent side="bottom">
+-                {webuiDescription}
+-              </TooltipContent>
+-            )}
+-          </Tooltip>
+-        </TooltipProvider>
+-        <TouchDescriptionPopover description={webuiDescription} />
+-      </div>
+-
+-      <div className="flex h-10 flex-1 items-center justify-center">
+-        <TabsNavigation />
+-        {isGuestMode && (
+-          <div className="ml-2 self-center px-2 py-1 text-xs bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200 rounded-md">
+-            {t('login.guestMode', 'Guest Mode')}
+-          </div>
+-        )}
+-      </div>
+-
+-      <nav className="w-[200px] flex items-center justify-end">
+-        <div className="flex items-center gap-2">
+-          {versionDisplay && (
+-            <TooltipProvider>
+-              <Tooltip>
+-                <TooltipTrigger asChild>
+-                  <span className="text-xs text-gray-500 dark:text-gray-400 mr-1 cursor-default">
+-                    v{versionDisplay}
+-                  </span>
+-                </TooltipTrigger>
++          <TooltipProvider>
++            <Tooltip>
++              <TooltipTrigger asChild>
++                <a href={entryHomeHref(window.location.pathname)} className="flex items-center">
++                  <ZapIcon className="mr-2 size-4 text-emerald-400" aria-hidden="true" />
++                  <span className="font-bold md:inline-block">{SiteInfo.name}</span>
++                  {webuiTitle && (
++                    <>
++                      <span className="mx-1 text-xs text-gray-500 dark:text-gray-400" aria-hidden="true">|</span>
++                      <span className="text-sm font-medium">{webuiTitle}</span>
++                    </>
++                  )}
++                </a>
++              </TooltipTrigger>
++              {webuiDescription && (
+                 <TooltipContent side="bottom">
+-                  {versionTooltip}
++                  {webuiDescription}
+                 </TooltipContent>
+-              </Tooltip>
+-            </TooltipProvider>
++              )}
++            </Tooltip>
++          </TooltipProvider>
++          <TouchDescriptionPopover description={webuiDescription} />
++          <div className="ml-3 min-w-0">
++            <WorkspaceSelector />
++          </div>
++        </div>
++
++        <div className="flex h-10 flex-1 items-center justify-center">
++          <TabsNavigation />
++          {isGuestMode && (
++            <div className="ml-2 self-center px-2 py-1 text-xs bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200 rounded-md">
++              {t('login.guestMode', 'Guest Mode')}
++            </div>
+           )}
+-          {apiDocsCapability === 'available' && (
+-            <Button variant="ghost" size="icon" side="bottom" tooltip={t('header.apiDocs')}>
+-              <a href={apiDocsUrl} target="_blank" rel="noopener noreferrer">
+-                <BookOpenIcon className="size-4" aria-hidden="true" />
++        </div>
++
++        <nav className="flex items-center justify-end">
++          <div className="flex items-center gap-2">
++            {versionDisplay && (
++              <TooltipProvider>
++                <Tooltip>
++                  <TooltipTrigger asChild>
++                    <span className="text-xs text-gray-500 dark:text-gray-400 mr-1 cursor-default">
++                      v{versionDisplay}
++                    </span>
++                  </TooltipTrigger>
++                  <TooltipContent side="bottom">
++                    {versionTooltip}
++                  </TooltipContent>
++                </Tooltip>
++              </TooltipProvider>
++            )}
++            {apiDocsCapability === 'available' && (
++              <Button variant="ghost" size="icon" side="bottom" tooltip={t('header.apiDocs')}>
++                <a href={apiDocsUrl} target="_blank" rel="noopener noreferrer">
++                  <BookOpenIcon className="size-4" aria-hidden="true" />
++                </a>
++              </Button>
++            )}
++            <Button variant="ghost" size="icon" side="bottom" tooltip={t('header.projectRepository')}>
++              <a href={SiteInfo.github} target="_blank" rel="noopener noreferrer">
++                <GithubIcon className="size-4" />
+               </a>
+             </Button>
+-          )}
+-          <Button variant="ghost" size="icon" side="bottom" tooltip={t('header.projectRepository')}>
+-            <a href={SiteInfo.github} target="_blank" rel="noopener noreferrer">
+-              <GithubIcon className="size-4" />
+-            </a>
+-          </Button>
+-          <AppSettings />
+-          {!isGuestMode && (
+-            <Button
+-              variant="ghost"
+-              size="icon"
+-              side="bottom"
+-              tooltip={`${t('header.logout')} (${username})`}
+-              onClick={handleLogout}
+-            >
+-              <LogOutIcon className="size-4" aria-hidden="true" />
+-            </Button>
+-          )}
+-        </div>
+-      </nav>
+-    </header>
++            <AppSettings />
++            {!isGuestMode && (
++              <Button
++                variant="ghost"
++                size="icon"
++                side="bottom"
++                tooltip={`${t('header.logout')} (${username})`}
++                onClick={handleLogout}
++              >
++                <LogOutIcon className="size-4" aria-hidden="true" />
++              </Button>
++            )}
++          </div>
++        </nav>
++      </header>
++      <WorkspaceReadOnlyNotice />
++    </>
+   )
+ }
+diff --git a/lightrag_webui/src/features/loginLogo.test.tsx b/lightrag_webui/src/features/loginLogo.test.tsx
+index 40bcf5f..dfb8826 100644
+--- a/lightrag_webui/src/features/loginLogo.test.tsx
++++ b/lightrag_webui/src/features/loginLogo.test.tsx
+@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom'
+ import { renderWithProviders } from '@/test/render'
+ import { useAuthStore } from '@/stores/state'
+ import { resetCustomization, seedCustomization } from '@/test/customization'
++import { WorkspaceBootstrapError } from '@/api/errors'
+ 
+ const BUNDLE_LOGO = 'https://cdn.example.test/acme-logo.png'
+ 
+@@ -20,6 +21,8 @@ const BUNDLE_LOGO = 'https://cdn.example.test/acme-logo.png'
+  */
+ let realApiModule: Record<string, unknown>
+ let LoginPage: typeof import('./LoginPage').default
++let authFailure: WorkspaceBootstrapError | null = null
++const originalRuntimeConfig = window.__LIGHTRAG_CONFIG__
+ 
+ /**
+  * What `/auth-status` reports for the next render. Read INSIDE the mock so a
+@@ -35,7 +38,10 @@ beforeAll(async () => {
+   realApiModule = { ...(await import('@/api/lightrag')) }
+   mock.module('@/api/lightrag', () => ({
+     ...realApiModule,
+-    getAuthStatus: mock(async () => authStatus)
++    getAuthStatus: mock(async () => {
++      if (authFailure) throw authFailure
++      return authStatus
++    })
+   }))
+   LoginPage = (await import('./LoginPage')).default
+ })
+@@ -46,6 +52,7 @@ afterAll(() => {
+ 
+ beforeEach(() => {
+   authStatus = { auth_configured: true }
++  authFailure = null
+   // These are pre-login pages; an earlier test file that activates a session
+   // would otherwise leave them rendering nothing. The precondition belongs
+   // to the test, not to whatever ran before it.
+@@ -63,6 +70,7 @@ afterEach(() => {
+   // seeded snapshot. `cleanup` is idempotent, so the preload's own call is
+   // still fine.
+   cleanup()
++  window.__LIGHTRAG_CONFIG__ = originalRuntimeConfig
+   resetCustomization()
+ })
+ 
+@@ -89,6 +97,24 @@ const renderLogin = async () => {
+   return view
+ }
+ 
++describe('gateway login bootstrap failure', () => {
++  for (const [reason, status] of [['unavailable', 409], ['unavailable', 503], ['timeout', undefined], ['network', undefined]] as const) {
++    test(`${reason} ${status ?? ''} keeps the workspace error and selector instead of a login form`, async () => {
++      window.__LIGHTRAG_CONFIG__ = {
++        workspaceId: 'research',
++        workspaces: [{ id: 'research', documents: 1, processed: 1, pending: 0, processing: 0, failed: 0, readOnly: false }]
++      }
++      seedCustomization({}, { customized: false })
++      authFailure = new WorkspaceBootstrapError(reason, status)
++      await renderLogin()
++      expect(await screen.findByRole('alert')).toHaveTextContent('Could not open workspace research')
++      expect(screen.getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
++      expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
++      expect(screen.queryAllByRole('textbox')).toHaveLength(0)
++    })
++  }
++})
++
+ describe('login page branding', () => {
+   test('shows the bundle logo with the bundle alt text', async () => {
+     seedCustomization({ logo_url: BUNDLE_LOGO, logo_alt: 'Acme Corp' })
+diff --git a/lightrag_webui/src/features/workspace/WorkspaceApp.tsx b/lightrag_webui/src/features/workspace/WorkspaceApp.tsx
+index 7611949..fa4b29d 100644
+--- a/lightrag_webui/src/features/workspace/WorkspaceApp.tsx
++++ b/lightrag_webui/src/features/workspace/WorkspaceApp.tsx
+@@ -24,6 +24,10 @@ import {
+ import { entryHomeHref } from '@/lib/pathPrefix'
+ import { navigationService } from '@/services/navigation'
+ import WorkspaceQueryView from './WorkspaceQueryView'
++import WorkspaceSelector from '@/components/WorkspaceSelector'
++import WorkspaceReadOnlyNotice from '@/components/WorkspaceReadOnlyNotice'
++import { WorkspaceOpeningStatus } from '@/components/WorkspaceOpening'
++import { isWorkspaceBootstrapError, type WorkspaceBootstrapError } from '@/api/errors'
+ 
+ /**
+  * The workspace entry's app shell: a slim header (brand, deployment title,
+@@ -38,6 +42,7 @@ export default function WorkspaceApp() {
+   const { t } = useTranslation()
+   const { isGuestMode, username, webuiTitle, webuiDescription } = useAuthStore()
+   const [initializing, setInitializing] = useState(true)
++  const [workspaceError, setWorkspaceError] = useState<WorkspaceBootstrapError | null>(null)
+   // Dialog visibility is DERIVED, not synced: the probe signals through a
+   // monotonic counter and this records the count the user last dismissed, so
+   // two consecutive failures with the IDENTICAL message still reopen it (and
+@@ -80,6 +85,7 @@ export default function WorkspaceApp() {
+         markVersionCheckedFromLogin()
+       } catch (error) {
+         console.error('Failed to get version info:', error)
++        if (isWorkspaceBootstrapError(error)) setWorkspaceError(error)
+       } finally {
+         setInitializing(false)
+       }
+@@ -91,9 +97,9 @@ export default function WorkspaceApp() {
+   // Startup probe: an API-key-only deployment rejects queries until a key is
+   // stored, and this entry has no other place to enter one.
+   useEffect(() => {
+-    if (initializing) return
++    if (initializing || workspaceError) return
+     runCredentialProbe()
+-  }, [initializing])
++  }, [initializing, workspaceError])
+ 
+   // Requests come from the startup probe AND from a query rejected on
+   // credential grounds (the server key can be rotated long after startup).
+@@ -125,7 +131,7 @@ export default function WorkspaceApp() {
+         paddingBottom: 'env(safe-area-inset-bottom)'
+       }}
+     >
+-      <header className="border-border/40 bg-background/95 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50 flex h-11 w-full shrink-0 items-center border-b px-3 backdrop-blur md:px-4">
++      <header className="border-border/40 bg-background/95 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50 flex min-h-11 w-full shrink-0 flex-wrap items-center gap-x-2 border-b px-3 backdrop-blur md:px-4">
+         <div className="flex min-w-0 flex-1 items-center gap-2">
+           {/* Document-relative brand link: resolves to THIS entry's own root
+               under any proxy prefix — never to /webui, and never to the admin
+@@ -146,6 +152,7 @@ export default function WorkspaceApp() {
+             </Tooltip>
+           </TooltipProvider>
+           <TouchDescriptionPopover description={webuiDescription} />
++          <WorkspaceSelector />
+           {isGuestMode && (
+             <span className="rounded-md bg-amber-100 px-2 py-0.5 text-xs text-amber-800 dark:bg-amber-900 dark:text-amber-200">
+               {t('login.guestMode', 'Guest Mode')}
+@@ -174,15 +181,12 @@ export default function WorkspaceApp() {
+           )}
+         </nav>
+       </header>
++      <WorkspaceReadOnlyNotice />
+ 
+       <div className="relative min-h-0 grow">
+-        {initializing ? (
++        {initializing || workspaceError ? (
+           <div className="flex h-full items-center justify-center">
+-            <div
+-              className="border-primary size-8 animate-spin rounded-full border-4 border-t-transparent"
+-              role="status"
+-              aria-label="Loading"
+-            />
++            <WorkspaceOpeningStatus error={workspaceError} />
+           </div>
+         ) : (
+           <ErrorBoundary>
+diff --git a/lightrag_webui/src/features/workspace/WorkspaceWelcome.test.tsx b/lightrag_webui/src/features/workspace/WorkspaceWelcome.test.tsx
+index 09a313a..ea8dbb4 100644
+--- a/lightrag_webui/src/features/workspace/WorkspaceWelcome.test.tsx
++++ b/lightrag_webui/src/features/workspace/WorkspaceWelcome.test.tsx
+@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom'
+ import { renderWithProviders } from '@/test/render'
+ import { useAuthStore } from '@/stores/state'
+ import { resetCustomization, seedCustomization } from '@/test/customization'
++import { WorkspaceBootstrapError } from '@/api/errors'
+ 
+ const DESCRIPTION = 'Internal deployment — do not share externally'
+ 
+@@ -17,12 +18,17 @@ const DESCRIPTION = 'Internal deployment — do not share externally'
+  */
+ let realApiModule: Record<string, unknown>
+ let WorkspaceWelcome: typeof import('./WorkspaceWelcome').default
++let authFailure: WorkspaceBootstrapError | null = null
++const originalRuntimeConfig = window.__LIGHTRAG_CONFIG__
+ 
+ beforeAll(async () => {
+   realApiModule = { ...(await import('@/api/lightrag')) }
+   mock.module('@/api/lightrag', () => ({
+     ...realApiModule,
+-    getAuthStatus: mock(async () => ({ auth_configured: true }))
++    getAuthStatus: mock(async () => {
++      if (authFailure) throw authFailure
++      return { auth_configured: true }
++    })
+   }))
+   WorkspaceWelcome = (await import('./WorkspaceWelcome')).default
+ })
+@@ -32,6 +38,7 @@ afterAll(() => {
+ })
+ 
+ beforeEach(() => {
++  authFailure = null
+   // The welcome page is for visitors who are NOT signed in; an earlier test
+   // file that activates a session (authBootstrap) would otherwise leave this
+   // one rendering nothing at all. The precondition belongs to the test.
+@@ -49,6 +56,7 @@ afterEach(() => {
+   // seeded snapshot. `cleanup` is idempotent, so the preload's own call is
+   // still fine.
+   cleanup()
++  window.__LIGHTRAG_CONFIG__ = originalRuntimeConfig
+   resetCustomization()
+ })
+ 
+@@ -71,6 +79,20 @@ const renderWelcome = async () => {
+ }
+ 
+ describe('workspace welcome branding', () => {
++  test('a failed gateway opening offers retry and workspace selection instead of sign in', async () => {
++    window.__LIGHTRAG_CONFIG__ = {
++      workspaceId: 'research',
++      workspaces: [{ id: 'research', documents: 1, processed: 1, pending: 0, processing: 0, failed: 0, readOnly: false }]
++    }
++    authFailure = new WorkspaceBootstrapError('unavailable', 503)
++    seedCustomization({}, { customized: false })
++    await renderWelcome()
++    expect(await screen.findByRole('alert')).toHaveTextContent('Could not open workspace research')
++    expect(screen.getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
++    expect(screen.queryAllByRole('button', { name: 'Sign in' })).toHaveLength(0)
++  })
++
+   test('shows the deployment title', async () => {
+     seedCustomization({ title: 'Acme Knowledge Base' })
+     await renderWelcome()
+diff --git a/lightrag_webui/src/features/workspace/WorkspaceWelcome.tsx b/lightrag_webui/src/features/workspace/WorkspaceWelcome.tsx
+index 96b9494..ae977e0 100644
+--- a/lightrag_webui/src/features/workspace/WorkspaceWelcome.tsx
++++ b/lightrag_webui/src/features/workspace/WorkspaceWelcome.tsx
+@@ -11,6 +11,10 @@ import { useAuthStore } from '@/stores/state'
+ import { getAuthStatus } from '@/api/lightrag'
+ import { activateLoginIdentityFromToken } from '@/lib/loginIdentity'
+ import { markVersionCheckedFromLogin } from '@/lib/versionCheckCache'
++import WorkspaceSelector from '@/components/WorkspaceSelector'
++import WorkspaceOpening, { WorkspaceOpeningStatus } from '@/components/WorkspaceOpening'
++import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
++import { isWorkspaceBootstrapError, type WorkspaceBootstrapError } from '@/api/errors'
+ 
+ /**
+  * The workspace entry's public welcome page — the unauthenticated default of
+@@ -31,6 +35,7 @@ export default function WorkspaceWelcome() {
+   const { isAuthenticated } = useAuthStore()
+   const content = useCustomizedContent()
+   const [authConfigured, setAuthConfigured] = useState<boolean | null>(null)
++  const [workspaceError, setWorkspaceError] = useState<WorkspaceBootstrapError | null>(null)
+   const [entering, setEntering] = useState(false)
+   // Latch the URL that failed, not a boolean: a transient failure must not
+   // keep hiding the logo after a language switch supplies a different URL.
+@@ -48,7 +53,10 @@ export default function WorkspaceWelcome() {
+         // Read auth_configured ONLY; a piggybacked guest token is dropped.
+         setAuthConfigured(status.auth_configured)
+       })
+-      .catch(() => setAuthConfigured(true))
++      .catch((error) => {
++        if (isWorkspaceBootstrapError(error)) setWorkspaceError(error)
++        else setAuthConfigured(true)
++      })
+   }, [isAuthenticated])
+ 
+   const handlePrimaryAction = useCallback(async () => {
+@@ -88,7 +96,8 @@ export default function WorkspaceWelcome() {
+       }
+     } catch (error) {
+       console.error('Failed to enter workspace:', error)
+-      toast.error(t('workspace.welcome.enterFailed', 'Could not reach the server. Please try again.'))
++      if (isWorkspaceBootstrapError(error)) setWorkspaceError(error)
++      else toast.error(t('workspace.welcome.enterFailed', 'Could not reach the server. Please try again.'))
+     } finally {
+       setEntering(false)
+     }
+@@ -98,6 +107,7 @@ export default function WorkspaceWelcome() {
+   if (isAuthenticated) {
+     return <Navigate to="/" replace />
+   }
++  if (workspaceError) return <WorkspaceOpening error={workspaceError} />
+ 
+   return (
+     <div
+@@ -116,6 +126,7 @@ export default function WorkspaceWelcome() {
+           right: 'calc(env(safe-area-inset-right) + 1rem)'
+         }}
+       >
++        <WorkspaceSelector />
+         <AppSettings className="bg-white/30 backdrop-blur-sm dark:bg-gray-800/30 rounded-md" />
+       </div>
+       {/* The card centers in the space ABOVE the footer, which keeps the
+@@ -127,12 +138,8 @@ export default function WorkspaceWelcome() {
+           dir={content.direction}
+           className="flex max-h-full w-full max-w-[520px] flex-col items-center gap-6 overflow-y-auto rounded-xl bg-white/70 p-8 text-center shadow-lg backdrop-blur dark:bg-gray-900/70"
+         >
+-          {content.loading ? (
+-            <div
+-              className="border-primary size-8 animate-spin rounded-full border-4 border-t-transparent"
+-              role="status"
+-              aria-label="Loading"
+-            />
++          {content.loading || (getRuntimeWorkspaceConfig() && authConfigured === null) ? (
++            <WorkspaceOpeningStatus />
+           ) : (
+             <>
+               {content.logoUrl && failedLogoUrl !== content.logoUrl && (
+diff --git a/lightrag_webui/src/hooks/usePageRestoreGeneration.test.ts b/lightrag_webui/src/hooks/usePageRestoreGeneration.test.ts
+index 5828bc9..7d0646d 100644
+--- a/lightrag_webui/src/hooks/usePageRestoreGeneration.test.ts
++++ b/lightrag_webui/src/hooks/usePageRestoreGeneration.test.ts
+@@ -49,7 +49,7 @@ describe('BFCache consumers', () => {
+       expect(source).not.toContain('addEventListener(\'beforeunload\'')
+     }
+ 
+-    expect(appSource).toContain('[enableHealthCheck, apiKeyAlertOpen, pageRestoreGeneration]')
++    expect(appSource).toContain('[enableHealthCheck, apiKeyAlertOpen, pageRestoreGeneration, gatewayWorkspaceId, initializing, workspaceError]')
+     expect(documentManagerSource).toContain(
+       'pipelineActive, pageRestoreGeneration, startPollingInterval'
+     )
+diff --git a/lightrag_webui/src/lib/runtimeConfig.ts b/lightrag_webui/src/lib/runtimeConfig.ts
+index 2668b1d..77eca1b 100644
+--- a/lightrag_webui/src/lib/runtimeConfig.ts
++++ b/lightrag_webui/src/lib/runtimeConfig.ts
+@@ -17,10 +17,24 @@
+  * `constants.ts`); this module returns the raw injected value.
+  */
+ 
++export interface RuntimeWorkspace {
++  id: string
++  documents: number
++  processed: number
++  failed: number
++  pending: number
++  processing: number
++  readOnly: boolean
++  readOnlyReason?: string
++}
++
+ declare global {
+   interface Window {
+     __LIGHTRAG_CONFIG__?: {
+       apiPrefix?: string
++      workspaceId?: string
++      defaultWorkspace?: string
++      workspaces?: RuntimeWorkspace[]
+       /**
+        * Still injected by the server and pinned as part of the published
+        * `{apiPrefix, webuiPrefix}` shape (docs/MultiSiteDeployment.md), so
+@@ -50,6 +64,23 @@ export function getRuntimeApiPrefix(): string | undefined {
+   return config.apiPrefix
+ }
+ 
++/** Gateway metadata is immutable during a page visit; switching reloads the entry. */
++export function getRuntimeWorkspaceConfig() {
++  if (typeof window === 'undefined') return undefined
++  const current = window.__LIGHTRAG_CONFIG__
++  if (!current?.workspaceId || !current.workspaces?.length) return undefined
++  return {
++    workspaceId: current.workspaceId,
++    defaultWorkspace: current.defaultWorkspace || 'default',
++    workspaces: current.workspaces
++  }
++}
++
++/** Cold workers can take longer to open than an ordinary already-running server. */
++export function getRuntimeAuthTimeoutMs(): number {
++  return getRuntimeWorkspaceConfig() ? 240000 : 5000
++}
++
+ /**
+  * Deployment title (`WEBUI_TITLE`), or undefined/null when none is set.
+  *
+diff --git a/lightrag_webui/src/lib/storageKeys.ts b/lightrag_webui/src/lib/storageKeys.ts
+index ad739f9..33989c5 100644
+--- a/lightrag_webui/src/lib/storageKeys.ts
++++ b/lightrag_webui/src/lib/storageKeys.ts
+@@ -1,11 +1,10 @@
+ /**
+  * localStorage keys split out of the legacy `settings-storage` envelope.
+  *
+- * Key shape is `lightrag:<ns>:<name>`. `<ns>` is FIXED to the empty string in
+- * this phase — hence the double colon, kept on purpose so the key shape stays
+- * uniform and unambiguous to parse. A follow-up (client-state partitioning)
+- * will change `<ns>` from "always empty" to "derived from apiPrefix"; root
+- * and direct-port deployments will then not change a single byte.
++ * Gateway workspaces have separate query settings, conversations, prompts
++ * and graph-search histories. The configured default keeps the original names, preserving
++ * existing saved state. A full entry reload fixes the namespace for the
++ * entire lifetime of each store, including its migration and storage events.
+  *
+  * Write-ownership contract (runtime, i.e. outside the one-time migration):
+  * - query-settings-storage: written ONLY by the /webui entry.
+@@ -15,12 +14,19 @@
+  * it first may write ALL of these keys.
+  */
+ 
+-export const STORAGE_NS = ''
++import { getRuntimeWorkspaceConfig } from './runtimeConfig'
++import { createWorkspaceStorageKeys } from './workspaceRouting'
++
++const workspace = getRuntimeWorkspaceConfig()
++const keys = createWorkspaceStorageKeys(workspace?.workspaceId, workspace?.defaultWorkspace)
++
++export const STORAGE_NS = keys.namespace
+ 
+ export const storageKey = (name: string): string => `lightrag:${STORAGE_NS}:${name}`
+ 
+-export const QUERY_SETTINGS_STORAGE_KEY = storageKey('query-settings-storage')
+-export const WEBUI_RETRIEVAL_HISTORY_KEY = storageKey('webui-retrieval-history')
+-export const WORKSPACE_RETRIEVAL_HISTORY_KEY = storageKey('workspace-retrieval-history')
++export const QUERY_SETTINGS_STORAGE_KEY = keys.querySettings
++export const WEBUI_RETRIEVAL_HISTORY_KEY = keys.webuiHistory
++export const WORKSPACE_RETRIEVAL_HISTORY_KEY = keys.workspaceHistory
+ 
+-export const LEGACY_SETTINGS_STORAGE_KEY = 'settings-storage'
++export const LEGACY_SETTINGS_STORAGE_KEY = keys.settings
++export const SEARCH_HISTORY_STORAGE_KEY = keys.searchHistory
+diff --git a/lightrag_webui/src/lib/workspaceRouting.test.ts b/lightrag_webui/src/lib/workspaceRouting.test.ts
+new file mode 100644
+index 0000000..513cf9c
+--- /dev/null
++++ b/lightrag_webui/src/lib/workspaceRouting.test.ts
+@@ -0,0 +1,83 @@
++import { describe, expect, test } from 'bun:test'
++import { createWorkspaceStorageKeys, workspaceEntryPath } from './workspaceRouting'
++
++describe('workspace routing', () => {
++  test('preserves each entry and encodes workspace names as one URL segment', () => {
++    expect(workspaceEntryPath('meeting-notes', '/workspaces/archive/webui/')).toBe('/workspaces/meeting-notes/webui/')
++    expect(workspaceEntryPath('meeting-notes', '/workspaces/archive/workspace/')).toBe('/workspaces/meeting-notes/workspace/')
++    expect(workspaceEntryPath('notes & research', '/workspace.html')).toBe('/workspaces/notes%20%26%20research/workspace/')
++    expect(workspaceEntryPath('one/two', '/webui/')).toBe('/workspaces/one%2Ftwo/webui/')
++  })
++})
++
++describe('workspace browser state isolation', () => {
++  test('the actual persisted keys bind to the injected workspace before stores or migrations load', () => {
++    // Each entry load evaluates these module constants once. Separate Bun
++    // processes reproduce that startup ordering without changing cached
++    // singletons or browser globals shared by the rest of the test suite.
++    const readEntryKeys = (workspaceId: string) => {
++      const modulePath = new URL('./storageKeys.ts', import.meta.url).pathname
++      const script = `globalThis.window = { __LIGHTRAG_CONFIG__: ${JSON.stringify({ workspaceId, defaultWorkspace: 'default', workspaces: [{ id: workspaceId }] })} }; const keys = await import(${JSON.stringify(modulePath)}); console.log(JSON.stringify(Object.fromEntries(Object.entries(keys).filter(([name]) => name.endsWith('_KEY')))));`
++      const result = Bun.spawnSync([process.execPath, '--eval', script])
++      expect(result.exitCode).toBe(0)
++      return JSON.parse(result.stdout.toString()) as Record<string, string>
++    }
++    const primary = readEntryKeys('default')
++    const personal = readEntryKeys('meeting-notes')
++    expect(primary.LEGACY_SETTINGS_STORAGE_KEY).toBe('settings-storage')
++    expect(primary.WEBUI_RETRIEVAL_HISTORY_KEY).toBe('lightrag::webui-retrieval-history')
++    for (const name of Object.keys(primary)) {
++      expect(personal[name]).not.toBe(primary[name])
++      expect(personal[name]).toStartWith('lightrag:meeting-notes:')
++    }
++  })
++
++  test('keeps every original default-workspace key, including pre-split and graph-search history', () => {
++    const keys = createWorkspaceStorageKeys('default')
++    expect(keys).toEqual({
++      namespace: '',
++      settings: 'settings-storage',
++      querySettings: 'lightrag::query-settings-storage',
++      webuiHistory: 'lightrag::webui-retrieval-history',
++      workspaceHistory: 'lightrag::workspace-retrieval-history',
++      searchHistory: 'lightrag_search_history'
++    })
++    expect(createWorkspaceStorageKeys()).toEqual(keys)
++  })
++
++  test('the configured default retains legacy keys even when its ID is not default', () => {
++    const configured = createWorkspaceStorageKeys('custom-root', 'custom-root')
++    const other = createWorkspaceStorageKeys('default', 'custom-root')
++    expect(configured.namespace).toBe('')
++    expect(configured.settings).toBe('settings-storage')
++    expect(other.namespace).toBe('default')
++    expect(other.settings).toBe('lightrag:default:settings-storage')
++  })
++
++  test('partitions prompts, query settings, both conversations and graph searches between corpora', () => {
++    const primary = createWorkspaceStorageKeys('default')
++    const research = createWorkspaceStorageKeys('research')
++    const personal = createWorkspaceStorageKeys('meeting-notes')
++    const contentKeys = ['settings', 'querySettings', 'webuiHistory', 'workspaceHistory', 'searchHistory'] as const
++    const storage = new Map<string, string>()
++    for (const field of contentKeys) {
++      storage.set(primary[field], `default workspace ${field}`)
++      storage.set(research[field], `Research ${field}`)
++      storage.set(personal[field], `Personal ${field}`)
++    }
++    expect(storage.size).toBe(15)
++    for (const field of contentKeys) {
++      expect(storage.get(primary[field])).toBe(`default workspace ${field}`)
++      expect(storage.get(research[field])).toBe(`Research ${field}`)
++      expect(storage.get(personal[field])).toBe(`Personal ${field}`)
++      storage.delete(research[field])
++      expect(storage.get(primary[field])).toBe(`default workspace ${field}`)
++      expect(storage.get(personal[field])).toBe(`Personal ${field}`)
++    }
++  })
++
++  test('keeps legacy hyphenated workspace names distinct from underscored names', () => {
++    expect(createWorkspaceStorageKeys('meeting-notes').namespace).toBe('meeting-notes')
++    expect(createWorkspaceStorageKeys('meeting-notes').settings).not.toBe(createWorkspaceStorageKeys('meeting_notes').settings)
++  })
++})
+diff --git a/lightrag_webui/src/lib/workspaceRouting.ts b/lightrag_webui/src/lib/workspaceRouting.ts
+new file mode 100644
+index 0000000..9d55b7d
+--- /dev/null
++++ b/lightrag_webui/src/lib/workspaceRouting.ts
+@@ -0,0 +1,29 @@
++export type WorkspaceEntry = 'webui' | 'workspace'
++
++/** Preserve the current entry, while dropping the previous corpus's route state. */
++export function workspaceEntryPath(workspaceId: string, pathname: string): string {
++  const entry: WorkspaceEntry = /\/(?:workspace(?:\/|\.html)?)(?:[^/]*)?$/.test(pathname)
++    ? 'workspace'
++    : 'webui'
++  return `/workspaces/${encodeURIComponent(workspaceId)}/${entry}/`
++}
++
++/**
++ * The configured default retains every pre-gateway browser key. Other corpora never read,
++ * migrate or overwrite those keys, including the old settings envelope that
++ * still owns prompt history and graph labels.
++ */
++export function createWorkspaceStorageKeys(workspaceId?: string, defaultWorkspace = 'default') {
++  const namespace = workspaceId && workspaceId !== defaultWorkspace
++    ? encodeURIComponent(workspaceId)
++    : ''
++  const storageKey = (name: string) => `lightrag:${namespace}:${name}`
++  return {
++    namespace,
++    querySettings: storageKey('query-settings-storage'),
++    webuiHistory: storageKey('webui-retrieval-history'),
++    workspaceHistory: storageKey('workspace-retrieval-history'),
++    settings: namespace ? storageKey('settings-storage') : 'settings-storage',
++    searchHistory: namespace ? storageKey('search-history') : 'lightrag_search_history'
++  }
++}
+diff --git a/lightrag_webui/src/locales/en.json b/lightrag_webui/src/locales/en.json
+index ff04a3c..283c481 100644
+--- a/lightrag_webui/src/locales/en.json
++++ b/lightrag_webui/src/locales/en.json
+@@ -519,6 +519,22 @@
+     "lastPage": "Last Page"
+   },
+   "workspace": {
++    "switcher": {
++      "label": "Workspace",
++      "opening": "Opening workspace {{workspace}}…",
++      "openingFailed": "Could not open workspace {{workspace}}",
++      "retry": "Try again",
++      "openingError": {
++        "unavailable": "The workspace is unavailable. Try again or choose another workspace.",
++        "timeout": "Opening the workspace took too long. Try again or choose another workspace.",
++        "network": "Could not reach the workspace. Check the connection and try again, or choose another workspace.",
++        "invalid_response": "The server did not return a valid workspace response. Try again or choose another workspace."
++      },
++      "firstVisit": "The first visit can take a little longer while your documents load.",
++      "storageIdentity": "Workspace names identify the selected corpus. Saved storage namespaces are unchanged.",
++      "readOnly": "read only",
++      "preservedNotice": "Existing documents are preserved. Adding or changing documents is paused for this workspace."
++    },
+     "welcome": {
+       "defaultMarkdown": "Welcome! Ask questions about the knowledge base and get answers with citations. Sign in to get started.",
+       "enterButton": "Enter workspace",
+diff --git a/lightrag_webui/src/locales/ru.json b/lightrag_webui/src/locales/ru.json
+index 09aa260..c131b9c 100644
+--- a/lightrag_webui/src/locales/ru.json
++++ b/lightrag_webui/src/locales/ru.json
+@@ -519,6 +519,22 @@
+     "lastPage": "Последняя страница"
+   },
+   "workspace": {
++    "switcher": {
++      "label": "Рабочее пространство",
++      "opening": "Открываем пространство {{workspace}}…",
++      "openingFailed": "Не удалось открыть пространство {{workspace}}",
++      "retry": "Повторить",
++      "openingError": {
++        "unavailable": "Пространство недоступно. Повторите попытку или выберите другое пространство.",
++        "timeout": "Открытие пространства заняло слишком много времени. Повторите попытку или выберите другое пространство.",
++        "network": "Не удалось связаться с пространством. Проверьте соединение и повторите попытку или выберите другое пространство.",
++        "invalid_response": "Сервер не вернул корректный ответ пространства. Повторите попытку или выберите другое пространство."
++      },
++      "firstVisit": "Первое открытие может занять немного больше времени, пока загружаются ваши документы.",
++      "storageIdentity": "Здесь указано выбранное пространство. Имена пространств в сохранённых данных не изменены.",
++      "readOnly": "только чтение",
++      "preservedNotice": "Существующие документы сохранены. Добавление и изменение документов в этом пространстве приостановлено."
++    },
+     "welcome": {
+       "defaultMarkdown": "Добро пожаловать! Задавайте вопросы по базе знаний и получайте ответы с цитатами. Войдите, чтобы начать.",
+       "enterButton": "Войти в рабочее пространство",
+diff --git a/lightrag_webui/src/migrations/importGraph.test.ts b/lightrag_webui/src/migrations/importGraph.test.ts
+index 019b0b4..79bbf2b 100644
+--- a/lightrag_webui/src/migrations/importGraph.test.ts
++++ b/lightrag_webui/src/migrations/importGraph.test.ts
+@@ -136,8 +136,8 @@ describe('navigation core stays graph-free', () => {
+   })
+ })
+ 
+-describe('no path-rewriting hard navigation in the SPA', () => {
+-  test('frontend source contains no location.href= / location.replace( / location.assign(', () => {
++describe('hard navigation is limited to deliberate workspace switching', () => {
++  test('auth and SPA navigation cannot rewrite the entry path', () => {
+     const output = execSync(
+       String.raw`grep -rnE "location\.href\s*=|location\.replace\(|location\.assign\(" --include='*.ts' --include='*.tsx' . || true`,
+       { cwd: SRC, encoding: 'utf8' }
+@@ -145,9 +145,12 @@ describe('no path-rewriting hard navigation in the SPA', () => {
+     const offenders = output
+       .split('\n')
+       .filter(Boolean)
+-      // window.location.reload() is allowed (same-URL reload, keeps entry);
+-      // test files may reference these strings.
++      // Auth and ordinary SPA navigation must retain this entry. Workspace
++      // switching is the sole exception: the selector deliberately reloads
++      // the same entry under another corpus prefix, clearing live state.
++      // Allow only that exact call, not arbitrary navigation in that file.
+       .filter((line) => !line.includes('.test.'))
++      .filter((line) => !/^\.\/components\/WorkspaceSelector\.tsx:\d+:\s*window\.location\.assign\(workspaceEntryPath\(workspaceId, window\.location\.pathname\)\)$/.test(line))
+     expect(offenders).toEqual([])
+   })
+ })
+diff --git a/lightrag_webui/src/utils/SearchHistoryManager.ts b/lightrag_webui/src/utils/SearchHistoryManager.ts
+index 0af592a..d914e23 100644
+--- a/lightrag_webui/src/utils/SearchHistoryManager.ts
++++ b/lightrag_webui/src/utils/SearchHistoryManager.ts
+@@ -1,4 +1,5 @@
+ import { searchHistoryMaxItems, searchHistoryVersion } from '@/lib/constants'
++import { SEARCH_HISTORY_STORAGE_KEY } from '@/lib/storageKeys'
+ 
+ /**
+  * SearchHistoryManager - Manages search history persistence in localStorage
+@@ -23,7 +24,7 @@ export interface SearchHistoryData {
+ }
+ 
+ export class SearchHistoryManager {
+-  private static readonly STORAGE_KEY = 'lightrag_search_history'
++  private static readonly STORAGE_KEY = SEARCH_HISTORY_STORAGE_KEY
+   private static readonly MAX_HISTORY = searchHistoryMaxItems
+   private static readonly VERSION = searchHistoryVersion
+ 

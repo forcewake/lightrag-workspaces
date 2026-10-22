@@ -1,0 +1,19 @@
+[project]
+name = "lightrag-workspaces"
+version = "0.1.0"
+description = "Workspace routing and data-preserving workers for pinned LightRAG"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "fastapi==0.135.2",
+    "httpx==0.28.1",
+    "uvicorn==0.41.0",
+]
+
+[dependency-groups]
+dev = [
+    "nano-vectordb==0.0.4.3",
+    "numpy==2.4.4",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,12 @@
+# Only these source files can enter the build context.
+**
+!Dockerfile
+!build_frontend.sh
+!frontend.patch
+!gateway.py
+!worker.py
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!scripts/
+scripts/**
+!scripts/init_workspace.py

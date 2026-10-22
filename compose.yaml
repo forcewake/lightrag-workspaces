@@ -1,0 +1,22 @@
+services:
+  lightrag:
+    build:
+      context: .
+    image: lightrag-workspaces:local
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 120s
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${LIGHTRAG_PORT:-9621}:9621"
+    env_file:
+      - .env
+    environment:
+      WORKING_DIR: /app/data/rag_storage
+      INPUT_DIR: /app/data/inputs
+      LIGHTRAG_MULTIWORKSPACE_RUNTIME: /app/data/workspace-runtime
+    volumes:
+      - ./data/rag_storage:/app/data/rag_storage
+      - ./data/inputs:/app/data/inputs
+      - ./data/runtime:/app/data/workspace-runtime
+    mem_limit: ${LIGHTRAG_MEMORY_LIMIT:-8g}
+    pids_limit: 512

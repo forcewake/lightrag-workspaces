@@ -1,0 +1,47 @@
+/* A reading-first manual: restrained color, editorial headings, local code overflow. */
+:root {
+  --md-primary-fg-color: #194c3c;
+  --md-accent-fg-color: #0b7055;
+  --md-default-bg-color: #fcfcf8;
+  --md-default-fg-color: #172923;
+  --md-default-fg-color--light: #4e635a;
+  --md-code-bg-color: #f2f5ef;
+  --md-typeset-a-color: #0b7055;
+}
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #163d31;
+  --md-accent-fg-color: #83d6ad;
+  --md-default-bg-color: #15211d;
+  --md-default-fg-color: #e6eee8;
+  --md-default-fg-color--light: #b5c7bc;
+  --md-code-bg-color: #1e3028;
+  --md-typeset-a-color: #83d6ad;
+}
+.md-header { box-shadow: none; border-bottom: 1px solid rgb(255 255 255 / 12%); }
+.md-header__title { font-weight: 650; letter-spacing: -.01em; }
+.md-typeset { line-height: 1.7; }
+.md-typeset > p, .md-typeset > ul, .md-typeset > ol { max-width: 72ch; }
+.md-typeset h1, .md-typeset h2 { font-family: Georgia, "Times New Roman", serif; letter-spacing: -.025em; }
+.md-typeset h1 { color: var(--md-default-fg-color); font-size: clamp(1.9rem, 3.4vw, 2.8rem); line-height: 1.15; font-weight: 500; margin-bottom: .7em; text-wrap: balance; }
+.md-typeset h2 { font-size: 1.55rem; line-height: 1.25; margin-top: 1.75em; font-weight: 500; }
+.md-typeset h3 { margin-top: 1.5em; }
+.md-typeset a { text-underline-offset: .18em; }
+.md-typeset a:hover { text-decoration: underline; }
+.md-typeset .md-button { border-radius: 5px; font-size: .78rem; padding: .65em 1.1em; margin: .2em .35em .2em 0; }
+.md-typeset picture { display: block; margin: 1.7rem 0 .4rem; }
+.md-typeset picture img { width: 100%; height: auto; }
+.md-typeset table:not([class]) { font-size: .73rem; }
+.md-typeset pre { border-radius: 5px; }
+.md-typeset code { font-variant-ligatures: none; }
+.md-nav__link { line-height: 1.5; }
+.md-nav__item--section > .md-nav__link { letter-spacing: .015em; }
+:focus-visible { outline: 3px solid var(--md-accent-fg-color); outline-offset: 3px; }
+::selection { background: #b9e4cc; color: #172923; }
+input, textarea { caret-color: var(--md-accent-fg-color); }
+* { scrollbar-color: #91ab9b transparent; scrollbar-width: thin; }
+@media (max-width: 600px) {
+  .md-typeset h1 { font-size: 2rem; }
+  .md-typeset { font-size: .8rem; }
+  .md-typeset .md-button { display: block; width: fit-content; }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; } }
