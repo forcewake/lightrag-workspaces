@@ -402,7 +402,9 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             if sleeps > 2:
                 raise asyncio.CancelledError
 
-        with patch("gateway.asyncio.sleep", side_effect=advance_sweeps):
+        # Make the worker idle independently of the host's monotonic uptime.
+        clock = SimpleNamespace(monotonic=lambda: self.config.idle_seconds + 1)
+        with patch("gateway.time", clock), patch("gateway.asyncio.sleep", side_effect=advance_sweeps):
             await manager._sweep()
         self.assertEqual(manager._terminate.await_count, 2)
 

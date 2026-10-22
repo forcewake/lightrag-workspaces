@@ -140,7 +140,7 @@ def smoke(engine: str, image: str, memory: str, startup_timeout: float) -> dict:
                       response["status"] == 200 and health.get("status") == "healthy" and
                       health.get("selected_workspace_id") == workspace and
                       health.get("startup_compatibility_writes") is False)
-            response = request(f"/workspaces/{workspace}/documents")
+            response = request(f"/workspaces/{workspace}/documents/status_counts")
             check("document status read: " + workspace, response["status"] == 200)
             response = request(f"/workspaces/{workspace}/docs")
             check("scoped Swagger: " + workspace, response["status"] == 200 and
