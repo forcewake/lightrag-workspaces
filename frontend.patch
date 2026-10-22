@@ -1300,10 +1300,10 @@ index 5828bc9..7d0646d 100644
        'pipelineActive, pageRestoreGeneration, startPollingInterval'
      )
 diff --git a/lightrag_webui/src/lib/runtimeConfig.ts b/lightrag_webui/src/lib/runtimeConfig.ts
-index 2668b1d..77eca1b 100644
+index 2668b1d..b6dc428 100644
 --- a/lightrag_webui/src/lib/runtimeConfig.ts
 +++ b/lightrag_webui/src/lib/runtimeConfig.ts
-@@ -17,10 +17,24 @@
+@@ -17,10 +17,25 @@
   * `constants.ts`); this module returns the raw injected value.
   */
  
@@ -1324,11 +1324,12 @@ index 2668b1d..77eca1b 100644
        apiPrefix?: string
 +      workspaceId?: string
 +      defaultWorkspace?: string
++      legacyStorageWorkspace?: string
 +      workspaces?: RuntimeWorkspace[]
        /**
         * Still injected by the server and pinned as part of the published
         * `{apiPrefix, webuiPrefix}` shape (docs/MultiSiteDeployment.md), so
-@@ -50,6 +64,23 @@ export function getRuntimeApiPrefix(): string | undefined {
+@@ -50,6 +65,24 @@ export function getRuntimeApiPrefix(): string | undefined {
    return config.apiPrefix
  }
  
@@ -1340,6 +1341,7 @@ index 2668b1d..77eca1b 100644
 +  return {
 +    workspaceId: current.workspaceId,
 +    defaultWorkspace: current.defaultWorkspace || 'default',
++    legacyStorageWorkspace: current.legacyStorageWorkspace || current.defaultWorkspace || 'default',
 +    workspaces: current.workspaces
 +  }
 +}
@@ -1353,7 +1355,7 @@ index 2668b1d..77eca1b 100644
   * Deployment title (`WEBUI_TITLE`), or undefined/null when none is set.
   *
 diff --git a/lightrag_webui/src/lib/storageKeys.ts b/lightrag_webui/src/lib/storageKeys.ts
-index ad739f9..33989c5 100644
+index ad739f9..a178ec6 100644
 --- a/lightrag_webui/src/lib/storageKeys.ts
 +++ b/lightrag_webui/src/lib/storageKeys.ts
 @@ -1,11 +1,10 @@
@@ -1366,7 +1368,7 @@ index ad739f9..33989c5 100644
 - * will change `<ns>` from "always empty" to "derived from apiPrefix"; root
 - * and direct-port deployments will then not change a single byte.
 + * Gateway workspaces have separate query settings, conversations, prompts
-+ * and graph-search histories. The configured default keeps the original names, preserving
++ * and graph-search histories. The stable legacy-storage workspace keeps the original names, preserving
 + * existing saved state. A full entry reload fixes the namespace for the
 + * entire lifetime of each store, including its migration and storage events.
   *
@@ -1381,7 +1383,7 @@ index ad739f9..33989c5 100644
 +import { createWorkspaceStorageKeys } from './workspaceRouting'
 +
 +const workspace = getRuntimeWorkspaceConfig()
-+const keys = createWorkspaceStorageKeys(workspace?.workspaceId, workspace?.defaultWorkspace)
++const keys = createWorkspaceStorageKeys(workspace?.workspaceId, workspace?.legacyStorageWorkspace)
 +
 +export const STORAGE_NS = keys.namespace
  
@@ -1399,10 +1401,10 @@ index ad739f9..33989c5 100644
 +export const SEARCH_HISTORY_STORAGE_KEY = keys.searchHistory
 diff --git a/lightrag_webui/src/lib/workspaceRouting.test.ts b/lightrag_webui/src/lib/workspaceRouting.test.ts
 new file mode 100644
-index 0000000..513cf9c
+index 0000000..2ff36af
 --- /dev/null
 +++ b/lightrag_webui/src/lib/workspaceRouting.test.ts
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,88 @@
 +import { describe, expect, test } from 'bun:test'
 +import { createWorkspaceStorageKeys, workspaceEntryPath } from './workspaceRouting'
 +
@@ -1420,9 +1422,9 @@ index 0000000..513cf9c
 +    // Each entry load evaluates these module constants once. Separate Bun
 +    // processes reproduce that startup ordering without changing cached
 +    // singletons or browser globals shared by the rest of the test suite.
-+    const readEntryKeys = (workspaceId: string) => {
++    const readEntryKeys = (workspaceId: string, defaultWorkspace = 'default', legacyStorageWorkspace?: string) => {
 +      const modulePath = new URL('./storageKeys.ts', import.meta.url).pathname
-+      const script = `globalThis.window = { __LIGHTRAG_CONFIG__: ${JSON.stringify({ workspaceId, defaultWorkspace: 'default', workspaces: [{ id: workspaceId }] })} }; const keys = await import(${JSON.stringify(modulePath)}); console.log(JSON.stringify(Object.fromEntries(Object.entries(keys).filter(([name]) => name.endsWith('_KEY')))));`
++      const script = `globalThis.window = { __LIGHTRAG_CONFIG__: ${JSON.stringify({ workspaceId, defaultWorkspace, legacyStorageWorkspace, workspaces: [{ id: workspaceId }] })} }; const keys = await import(${JSON.stringify(modulePath)}); console.log(JSON.stringify(Object.fromEntries(Object.entries(keys).filter(([name]) => name.endsWith('_KEY')))));`
 +      const result = Bun.spawnSync([process.execPath, '--eval', script])
 +      expect(result.exitCode).toBe(0)
 +      return JSON.parse(result.stdout.toString()) as Record<string, string>
@@ -1431,6 +1433,11 @@ index 0000000..513cf9c
 +    const personal = readEntryKeys('meeting-notes')
 +    expect(primary.LEGACY_SETTINGS_STORAGE_KEY).toBe('settings-storage')
 +    expect(primary.WEBUI_RETRIEVAL_HISTORY_KEY).toBe('lightrag::webui-retrieval-history')
++    // Changing the routing default must not move either corpus's persisted state.
++    expect(readEntryKeys('default', 'meeting-notes', 'default')).toEqual(primary)
++    expect(readEntryKeys('meeting-notes', 'meeting-notes', 'default')).toEqual(personal)
++    // An old gateway injects no separate owner: retain its original key contract.
++    expect(readEntryKeys('custom-root', 'custom-root')).toEqual(primary)
 +    for (const name of Object.keys(primary)) {
 +      expect(personal[name]).not.toBe(primary[name])
 +      expect(personal[name]).toStartWith('lightrag:meeting-notes:')
@@ -1450,7 +1457,7 @@ index 0000000..513cf9c
 +    expect(createWorkspaceStorageKeys()).toEqual(keys)
 +  })
 +
-+  test('the configured default retains legacy keys even when its ID is not default', () => {
++  test('the configured legacy owner retains keys even when its ID is not default', () => {
 +    const configured = createWorkspaceStorageKeys('custom-root', 'custom-root')
 +    const other = createWorkspaceStorageKeys('default', 'custom-root')
 +    expect(configured.namespace).toBe('')
@@ -1488,7 +1495,7 @@ index 0000000..513cf9c
 +})
 diff --git a/lightrag_webui/src/lib/workspaceRouting.ts b/lightrag_webui/src/lib/workspaceRouting.ts
 new file mode 100644
-index 0000000..9d55b7d
+index 0000000..e403303
 --- /dev/null
 +++ b/lightrag_webui/src/lib/workspaceRouting.ts
 @@ -0,0 +1,29 @@
@@ -1503,12 +1510,12 @@ index 0000000..9d55b7d
 +}
 +
 +/**
-+ * The configured default retains every pre-gateway browser key. Other corpora never read,
++ * The configured legacy-storage owner retains every pre-gateway browser key. Other corpora never read,
 + * migrate or overwrite those keys, including the old settings envelope that
 + * still owns prompt history and graph labels.
 + */
-+export function createWorkspaceStorageKeys(workspaceId?: string, defaultWorkspace = 'default') {
-+  const namespace = workspaceId && workspaceId !== defaultWorkspace
++export function createWorkspaceStorageKeys(workspaceId?: string, legacyStorageWorkspace = 'default') {
++  const namespace = workspaceId && workspaceId !== legacyStorageWorkspace
 +    ? encodeURIComponent(workspaceId)
 +    : ''
 +  const storageKey = (name: string) => `lightrag:${namespace}:${name}`

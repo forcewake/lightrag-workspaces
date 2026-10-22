@@ -30,8 +30,17 @@ class PortableConfigTests(unittest.TestCase):
             os.environ["LIGHTRAG_DEFAULT_WORKSPACE"] = "custom-default"
             self.assertEqual(Config.from_env().default_workspace, "custom-default")
 
+    def test_legacy_browser_storage_owner_is_optional_and_independent_of_routing_default(self):
+        with patch.dict(os.environ, {"LIGHTRAG_DEFAULT_WORKSPACE": "meeting-notes"}, clear=True):
+            self.assertIsNone(Config.from_env().legacy_storage_workspace)
+            os.environ["LIGHTRAG_LEGACY_STORAGE_WORKSPACE"] = "original-root"
+            config = Config.from_env()
+            self.assertEqual(config.default_workspace, "meeting-notes")
+            self.assertEqual(config.legacy_storage_workspace, "original-root")
+
     def test_bad_config_is_rejected_before_gateway_startup(self):
         for key, value in (("LIGHTRAG_DEFAULT_WORKSPACE", "../escape"),
+                           ("LIGHTRAG_LEGACY_STORAGE_WORKSPACE", "../escape"),
                            ("LIGHTRAG_MAX_ACTIVE_WORKSPACES", "0"),
                            ("LIGHTRAG_MAX_ACTIVE_WORKSPACES", "101"),
                            ("LIGHTRAG_WORKSPACE_STARTUP_TIMEOUT", "nan"),

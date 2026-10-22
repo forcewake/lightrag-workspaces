@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-10-22
+
+- Configurable `LIGHTRAG_LEGACY_STORAGE_WORKSPACE` keeps browser conversations and settings attached to their original workspace when the UI/API default changes.
+- Existing installations retain their current browser keys when the new setting is omitted; explicit URL and header selection remain unchanged.
+- English and Russian instructions for changing the default without moving existing data or browser history.
+
 ## 0.2.0 — 2026-10-22
 
 - Optional PostgreSQL storage for documents, chunks, status, cache, graph data, and recovery anchors, with float32 VCHORDRQ vector indexes.

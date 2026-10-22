@@ -52,10 +52,13 @@ class Config:
     storage_backend: str = "file"
     embedding_model: str | None = None
     postgres_database: str | None = None
+    legacy_storage_workspace: str | None = None
 
     def __post_init__(self) -> None:
         if not ID_PATTERN.fullmatch(self.default_workspace):
             raise ValueError("LIGHTRAG_DEFAULT_WORKSPACE must be one exact directory identifier")
+        if self.legacy_storage_workspace is not None and not ID_PATTERN.fullmatch(self.legacy_storage_workspace):
+            raise ValueError("LIGHTRAG_LEGACY_STORAGE_WORKSPACE must be one exact directory identifier")
         if not 1 <= self.max_workers <= 100:
             raise ValueError("LIGHTRAG_MAX_ACTIVE_WORKSPACES must be between 1 and 100")
         if self.embedding_dim < 1:
@@ -84,6 +87,7 @@ class Config:
             storage_backend=selected_backend(),
             embedding_model=os.environ.get("EMBEDDING_MODEL"),
             postgres_database=os.environ.get("POSTGRES_DATABASE"),
+            legacy_storage_workspace=os.environ.get("LIGHTRAG_LEGACY_STORAGE_WORKSPACE") or None,
         )
 
 
@@ -617,7 +621,9 @@ def create_app(config: Config, manager: Any = None, transport: Any = None) -> Fa
                 html_name = "index.html" if entry == "webui" else "workspace.html"
                 html = (config.static_root / html_name).read_text()
                 runtime = {"apiPrefix": prefix, "workspaceId": selected,
-                           "defaultWorkspace": config.default_workspace, "workspaces": inventory}
+                           "defaultWorkspace": config.default_workspace,
+                           "legacyStorageWorkspace": config.legacy_storage_workspace or config.default_workspace,
+                           "workspaces": inventory}
                 script = "<script>window.__LIGHTRAG_CONFIG__=" + json.dumps(runtime).replace("<", "\\u003c") + ";</script>"
                 html = html.replace("<head>", "<head>" + script, 1)
                 return Response(html, media_type="text/html", headers={**identity_headers, "Cache-Control": "no-store"})
