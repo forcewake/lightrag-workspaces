@@ -1,6 +1,6 @@
 # Adopt an existing installation
 
-Preserve the old deployment, take a cold backup, and verify the extension against an independent copy before changing the original writer. There is no automatic migration step.
+Preserve the old deployment, take a cold backup, and verify the extension against an independent copy before changing the original writer. There is no automatic migration step. This guide adopts the existing **file backend**. To transfer it into SQL, use [PostgreSQL + VectorChord](postgresql.md).
 
 ## Confirm the supported layout
 

@@ -26,7 +26,7 @@ If using an Unraid Docker template instead of Compose, reproduce the built image
 
 | Container path | Host purpose |
 | --- | --- |
-| `/app/data/rag_storage` | Parent directory of named corpus directories |
+| `/app/data/rag_storage` | Parent of file corpora, or a separate PostgreSQL control root after verified migration |
 | `/app/data/inputs` | Parent directory of per-workspace uploads |
 | `/app/data/workspace-runtime` | Separate private operational runtime directory |
 | `9621/tcp` | Gateway; apply the intended host bind address and port |
@@ -34,6 +34,14 @@ If using an Unraid Docker template instead of Compose, reproduce the built image
 Retain the image's gateway entrypoint. An old template's Post Arguments can accidentally invoke the stock server and bypass workspace routing. Set the provider and extension environment variables from the [configuration reference](../reference/configuration.md). Persist the memory limit and restart policy in the manager or template, not only in a temporary container command.
 
 The health check should use `/workspaces`, which does not load a corpus. Do not make container liveness depend on a large cold workspace.
+
+## PostgreSQL + VectorChord on Unraid
+
+Use an existing PostgreSQL container with compatible pgvector/VectorChord packages and an already preloaded VectorChord library. Create a **new dedicated database** for this deployment; do not reuse an existing application database. Follow [the migration guide](postgresql.md) with an independent read-only source copy and a new control directory.
+
+Connect LightRAG and PostgreSQL through a suitable Docker network, or use the intended host address and published PostgreSQL port. Preserve that network selection in the Unraid template. `POSTGRES_HOST=localhost` inside the LightRAG container does not reach the PostgreSQL container.
+
+After verified import, map the new control directory to `/app/data/rag_storage`, retain the original `inputs` mount, set `LIGHTRAG_STORAGE_BACKEND=postgres`, and keep the exact default workspace and provider/auth configuration. The original JSON/GraphML tree and old container remain available for rollback. Save both the old and new Unraid templates privately. PostgreSQL backups become part of the recovery plan; preserving appdata alone is no longer sufficient.
 
 ## Adopting existing appdata
 

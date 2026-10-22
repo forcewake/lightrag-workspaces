@@ -1,6 +1,6 @@
 # Separate corpora. One place to work.
 
-LightRAG Workspaces adds a workspace selector and explicit API routing to the pinned LightRAG server. Each corpus keeps its own directory and starts in a separate worker process when you open it.
+LightRAG Workspaces adds a workspace selector and explicit API routing to the pinned LightRAG server. Store corpora in local files or PostgreSQL with VectorChord; each active workspace runs in a separate process.
 
 <picture>
   <source media="(max-width: 600px)" srcset="assets/workspaces-mobile.svg">
@@ -20,13 +20,14 @@ LightRAG Workspaces adds a workspace selector and explicit API routing to the pi
 | Create a corpus and import your first file | [First workspace](getting-started/first-workspace.md) |
 | Select a workspace from an application | [API and streaming](guides/api.md) |
 | Keep an existing index | [Backup-first adoption](guides/existing-data.md) |
+| Transfer existing corpora into PostgreSQL | [PostgreSQL + VectorChord](guides/postgresql.md) |
 | Run it on Unraid | [Unraid guide](guides/unraid.md) |
 | Understand memory and compatibility | [Architecture and limits](reference/architecture.md) |
 | Read in Russian | [Быстрый старт](getting-started/quickstart.ru.md) |
 
 ## Know the supported boundary
 
-This is an independent community extension for **LightRAG 1.5.7**, with source and image pinned. It supports the file-backed `JsonKVStorage`, `JsonDocStatusStorage`, `NanoVectorDBStorage`, and `NetworkXStorage` combination.
+This is an independent community extension for **LightRAG 1.5.7**, with source and image pinned. It supports the file-backed `JsonKVStorage`, `JsonDocStatusStorage`, `NanoVectorDBStorage`, and `NetworkXStorage` combination, or the documented PostgreSQL + VCHORDRQ combination with ordinary PostgreSQL graph tables.
 
 Workspace selection separates corpus data and worker processes. It does **not** create per-workspace user permissions. Authentication and provider configuration are shared across the instance. The default Compose configuration listens only on localhost.
 

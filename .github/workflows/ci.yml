@@ -67,3 +67,27 @@ jobs:
         run: docker build -t lightrag-workspaces:ci .
       - name: Verify real workers with disposable data and no network
         run: python3 scripts/smoke_container.py --engine docker --image lightrag-workspaces:ci
+      - name: Start an isolated PostgreSQL and VectorChord fixture
+        run: |
+          docker network create lightrag-postgres-ci
+          docker run -d --name lightrag-postgres-ci --network lightrag-postgres-ci \
+            -e POSTGRES_PASSWORD=synthetic-ci-only -e POSTGRES_DB=lightrag_ci \
+            tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
+          for attempt in $(seq 1 30); do
+            if docker exec lightrag-postgres-ci pg_isready -U postgres -d lightrag_ci; then break; fi
+            sleep 1
+          done
+          docker exec lightrag-postgres-ci psql -v ON_ERROR_STOP=1 -U postgres -d lightrag_ci \
+            -c 'CREATE EXTENSION vector; CREATE EXTENSION vchord;'
+      - name: Verify migration, native PostgreSQL stores, and workspace routing
+        run: |
+          docker run --rm --network lightrag-postgres-ci --memory=6g --cpus=2 \
+            -e POSTGRES_HOST=lightrag-postgres-ci -e POSTGRES_PORT=5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=synthetic-ci-only -e POSTGRES_DATABASE=lightrag_ci \
+            --mount "type=bind,src=$PWD/scripts/smoke_postgres.py,dst=/checks/smoke_postgres.py,readonly" \
+            --entrypoint python lightrag-workspaces:ci /checks/smoke_postgres.py --target-database lightrag_ci
+      - name: Remove the owned PostgreSQL fixture
+        if: always()
+        run: |
+          docker rm -f lightrag-postgres-ci || true
+          docker network rm lightrag-postgres-ci || true

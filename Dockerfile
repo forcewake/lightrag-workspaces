@@ -9,7 +9,7 @@ RUN bash ./build_frontend.sh /build/webui
 
 # The worker preservation hooks deliberately support this LightRAG release only.
 FROM ghcr.io/hkuds/lightrag@sha256:5bdbd524931b011df246fe20888d110cef691e6804c12cde636a2b746d7de27e AS runtime
-COPY gateway.py worker.py /opt/lightrag-multiworkspace/
+COPY gateway.py worker.py postgres_backend.py postgres_inventory.py migrate_postgres.py /opt/lightrag-multiworkspace/
 COPY scripts/init_workspace.py /opt/lightrag-multiworkspace/scripts/init_workspace.py
 COPY LICENSE THIRD_PARTY_NOTICES.md /opt/lightrag-multiworkspace/
 COPY --from=frontend /build/webui/ /opt/lightrag-multiworkspace/webui/

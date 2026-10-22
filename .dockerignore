@@ -5,6 +5,9 @@
 !frontend.patch
 !gateway.py
 !worker.py
+!postgres_backend.py
+!postgres_inventory.py
+!migrate_postgres.py
 !LICENSE
 !THIRD_PARTY_NOTICES.md
 !scripts/

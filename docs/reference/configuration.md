@@ -9,19 +9,20 @@ Copy `.env.example` to `.env` and keep it private. Compose reads host options fr
 | `BIND_ADDRESS` | `127.0.0.1` | Compose host bind address; use network controls before changing it |
 | `LIGHTRAG_PORT` | `9621` | Published host port; the gateway listens on container port 9621 |
 | `LIGHTRAG_MEMORY_LIMIT` | `8g` | Compose container hard memory ceiling; size for your corpora |
+| `LIGHTRAG_STORAGE_BACKEND` | `file` | `file` or `postgres`; use the explicit migration procedure before changing |
 | `LIGHTRAG_DEFAULT_WORKSPACE` | `default` | Existing corpus used when no selector is supplied |
 | `LIGHTRAG_MAX_ACTIVE_WORKSPACES` | `2` | Maximum resident workers; memory admission can allow fewer |
 | `LIGHTRAG_WORKSPACE_STARTUP_TIMEOUT` | `240` | Maximum seconds to wait for a cold worker to become healthy |
 | `LIGHTRAG_WORKSPACE_IDLE_SECONDS` | `600` | Idle seconds before a worker becomes eligible for retirement |
 | `LIGHTRAG_WORKSPACE_MEMORY_HEADROOM_BYTES` | `2147483648` | Reserve subtracted from available memory before admitting a cold worker |
-| `WORKING_DIR` | `/app/data/rag_storage` | Container parent directory containing named corpus directories |
+| `WORKING_DIR` | `/app/data/rag_storage` | Parent of file corpora, or a separate PostgreSQL control root containing registered workspace folders |
 | `INPUT_DIR` | `/app/data/inputs` | Container parent directory for per-workspace uploads |
 | `LIGHTRAG_MULTIWORKSPACE_RUNTIME` | `/app/data/workspace-runtime` | Locks and logs; must remain outside the corpus tree |
 | `LIGHTRAG_MULTIWORKSPACE_STATIC` | `/opt/lightrag-multiworkspace/webui` | Built UI assets; normally leave at image default |
 
 The startup deadline defaults to **240 seconds**, and idle retirement defaults to **600 seconds**. A worker must also pass the idle check before retirement; elapsed time alone does not override active work.
 
-`LIGHTRAG_WORKER_BUDGET_DIVISOR` is internal: the gateway sets it from the worker-pool limit. Worker-level `WORKSPACE`, `WORKING_DIR`, `INPUT_DIR`, `HOST`, `PORT`, `WORKERS`, `LOG_DIR`, and `LIGHTRAG_API_PREFIX` are set internally for each selected corpus. Do not use upstream `WORKSPACE` as an alternative per-request selector.
+`LIGHTRAG_WORKER_BUDGET_DIVISOR` is internal: the gateway sets it from the worker-pool limit. Worker-level `WORKSPACE`, `POSTGRES_WORKSPACE`, `WORKING_DIR`, `INPUT_DIR`, `HOST`, `PORT`, `WORKERS`, `LOG_DIR`, and `LIGHTRAG_API_PREFIX` are set internally for each selected corpus. Do not use upstream `WORKSPACE` or `POSTGRES_WORKSPACE` as an alternative per-request selector.
 
 ## Provider identity
 
@@ -54,7 +55,7 @@ The worker divides configured LLM, embedding, rerank, and role budgets by the ma
 
 ## Storage contract
 
-Keep these upstream choices:
+The extension pins one coherent storage combination for the selected backend. In `LIGHTRAG_STORAGE_BACKEND=file`, it uses:
 
 ```dotenv
 LIGHTRAG_KV_STORAGE=JsonKVStorage
@@ -63,7 +64,34 @@ LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage
 LIGHTRAG_GRAPH_STORAGE=NetworkXStorage
 ```
 
-Other adapters are rejected by this worker. Do not assume database namespaces or external backend isolation follow the filesystem workspace contract.
+In `LIGHTRAG_STORAGE_BACKEND=postgres`, it uses:
+
+```dotenv
+LIGHTRAG_KV_STORAGE=PGKVStorage
+LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
+LIGHTRAG_VECTOR_STORAGE=PGVectorStorage
+LIGHTRAG_GRAPH_STORAGE=PGTableGraphStorage
+POSTGRES_VECTOR_INDEX_TYPE=VCHORDRQ
+```
+
+The worker validates the registered database, exact workspace mapping, embedding model, and dimension before starting. It overrides upstream workspace variables with the registered internal namespace. PostgreSQL is selected for the entire deployment; mixing file and database storage choices in one worker is unsupported. Other backend combinations are rejected.
+
+| PostgreSQL variable | Meaning |
+| --- | --- |
+| `POSTGRES_HOST`, `POSTGRES_PORT` | Required host reachable from the container; port defaults to `5432` |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD` | Dedicated database role and private credential |
+| `POSTGRES_DATABASE` | Required dedicated target database; no implicit fallback to `postgres` |
+| `POSTGRES_SSL_MODE` | Upstream TLS mode: `disable`, `prefer`, `require`, `verify-ca`, or `verify-full` |
+| `POSTGRES_SSL_CERT`, `POSTGRES_SSL_KEY`, `POSTGRES_SSL_ROOT_CERT`, `POSTGRES_SSL_CRL` | Optional upstream client/trust certificate paths, available inside the container |
+| `POSTGRES_MAX_CONNECTIONS` | Per-worker pool maximum; configure explicitly, for example `4` |
+| `POSTGRES_VECTOR_INDEX_TYPE` | Must be `VCHORDRQ` in this extension's PostgreSQL mode |
+| `POSTGRES_VCHORDRQ_EPSILON` | Search/recall setting; `2.3` is the reference starting configuration |
+| `POSTGRES_VCHORDRQ_PROBES` | Optional probe override; leave empty unless it matches your index partition hierarchy |
+| `POSTGRES_VCHORDRQ_BUILD_OPTIONS` | Optional VectorChord index options; leave empty for the initial unpartitioned setup |
+
+The gateway has an additional read-only metadata pool capped at two connections. It checks the target database identity and reads live document counts; discovery never creates tables or loads original JSON. The control root contains a `.postgres-workspace.json` registration under each exact public workspace ID. The offline importer publishes this file only after verification. Do not edit registrations or copy them between unrelated databases.
+
+See [PostgreSQL migration](../guides/postgresql.md) for extension installation, connection networking, an explicit import, and backup requirements. A configuration change alone does not migrate a corpus.
 
 ## File processing
 

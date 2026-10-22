@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 — 2026-10-22
+
+- Optional PostgreSQL storage for documents, chunks, status, cache, graph data, and recovery anchors, with float32 VCHORDRQ vector indexes.
+- Stable database namespaces and separate vector tables for each public workspace; existing UI, API header, and URL selectors keep their exact identifiers.
+- Explicit, resumable migration into an owned database, read-back verification, original-record archives, and readiness receipts that prevent accidental empty-corpus startup.
+- Reconstruction of missing recovery anchors from retained graph/chunk provenance without model calls; existing unfinished imports stay protected.
+- PostgreSQL installation, migration, backup, and rollback documentation in English and Russian. File-backed installations remain supported.
+
 ## 0.1.0 — 2026-10-22
 
 Initial public source release of the independent LightRAG Workspaces extension.

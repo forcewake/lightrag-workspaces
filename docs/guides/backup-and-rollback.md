@@ -2,6 +2,8 @@
 
 A rollback consists of restoring the previous application configuration and, when needed, the matching cold data snapshot. Keeping an old image alone does not recover files changed after cutover.
 
+For PostgreSQL deployments, the current corpus is in the database. Keep a consistent PostgreSQL backup, its pgvector/VectorChord versions and restore instructions, the matching control manifests and inputs, private connection settings, and the exact application revision. Test restoration into a separate database and deployment. A copy of the control directory alone is not a corpus backup.
+
 ## What to retain
 
 | Item | Why it matters |
@@ -12,6 +14,7 @@ A rollback consists of restoring the previous application configuration and, whe
 | Source revision and exact image identity | Reproduce the version that owned the snapshot |
 | Empty directories and file manifest | Preserve empty workspaces and verify the copy |
 | Old container configuration and image | Recreate the prior process without guessing |
+| PostgreSQL database backup, extension versions, identity token, and control registrations | Required in PostgreSQL mode; restore the database and its matching registration as one recovery set |
 
 Logs may include document or provider details. Keep backups private and protect credentials separately. Runtime locks are operational files, not corpus data; never mount a corpus directory as runtime.
 
@@ -42,6 +45,12 @@ If explicit uploads, queries, deletions, or other writes occurred, first decide 
 4. Verify the restored manifest, empty workspace directories, counts, and service health before normal use.
 
 Never delete the failed tree merely to make the restore fit. Keep a recovery copy until the restore and any post-snapshot data reconciliation are complete.
+
+## Returning from PostgreSQL to a file snapshot
+
+Stop the PostgreSQL application before restoring the old file deployment. Preserve the current database and input tree under separate recovery names, then restore the old image, file-mode settings, and matching file/input snapshot. Keep the old file corpus separate from the PostgreSQL control root.
+
+The importer does not export new PostgreSQL changes back to JSON. Returning to the old snapshot omits uploads, deletions, graph changes, and cache changes made after cutover. Decide the recovery point and reconcile required newer data before discarding anything. Retain the PostgreSQL recovery copy until that decision is complete.
 
 ## Upgrade safely
 

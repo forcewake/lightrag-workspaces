@@ -18,6 +18,8 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
+from postgres_backend import load_workspace_manifest, selected_backend
+
 ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
@@ -47,6 +49,9 @@ class Config:
     startup_timeout: float = 240
     idle_seconds: float = 600
     embedding_dim: int = 3072
+    storage_backend: str = "file"
+    embedding_model: str | None = None
+    postgres_database: str | None = None
 
     def __post_init__(self) -> None:
         if not ID_PATTERN.fullmatch(self.default_workspace):
@@ -55,6 +60,10 @@ class Config:
             raise ValueError("LIGHTRAG_MAX_ACTIVE_WORKSPACES must be between 1 and 100")
         if self.embedding_dim < 1:
             raise ValueError("EMBEDDING_DIM must be a positive integer")
+        if self.storage_backend not in ("file", "postgres"):
+            raise ValueError("LIGHTRAG_STORAGE_BACKEND must be file or postgres")
+        if self.storage_backend == "postgres" and (not self.embedding_model or not self.postgres_database):
+            raise ValueError("EMBEDDING_MODEL and POSTGRES_DATABASE are required for PostgreSQL workspaces")
         if not 0 < self.startup_timeout < float("inf"):
             raise ValueError("LIGHTRAG_WORKSPACE_STARTUP_TIMEOUT must be positive and finite")
         if not 0 < self.idle_seconds < float("inf"):
@@ -72,6 +81,9 @@ class Config:
             startup_timeout=float(os.environ.get("LIGHTRAG_WORKSPACE_STARTUP_TIMEOUT", "240")),
             idle_seconds=float(os.environ.get("LIGHTRAG_WORKSPACE_IDLE_SECONDS", "600")),
             embedding_dim=int(os.environ.get("EMBEDDING_DIM", "3072")),
+            storage_backend=selected_backend(),
+            embedding_model=os.environ.get("EMBEDDING_MODEL"),
+            postgres_database=os.environ.get("POSTGRES_DATABASE"),
         )
 
 
@@ -86,6 +98,32 @@ def workspace_metadata(config: Config) -> list[dict[str, Any]]:
             continue
         counts: dict[str, int] = {}
         item: dict[str, Any] = {"id": folder.name, "available": True, "readOnly": False}
+        if config.storage_backend == "postgres":
+            # PostgreSQL discovery accepts only explicitly registered control
+            # directories. Original JSON files are never consulted in this mode.
+            manifest_path = folder / ".postgres-workspace.json"
+            if not manifest_path.exists():
+                continue
+            try:
+                manifest = load_workspace_manifest(manifest_path, folder.name)
+                item.update(dimension=manifest["embedding_dim"],
+                            postgresWorkspace=manifest["postgres_workspace"],
+                            preserveBacklog=manifest["preserve_backlog"],
+                            readOnly=bool(manifest.get("read_only") or manifest["preserve_backlog"]),
+                            _postgresManifest=manifest)
+                if (item["dimension"] != config.embedding_dim
+                        or manifest["embedding_model"] != config.embedding_model
+                        or manifest["database"] != config.postgres_database):
+                    raise ValueError("Saved model or database identity disagrees with the configuration")
+            except (ValueError, OSError, TypeError, KeyError):
+                item.update(available=False, readOnly=True, readOnlyReason=(
+                    "PostgreSQL workspace registration needs inspection before opening."
+                ))
+            # Counts become authoritative only after the read-only database
+            # registry check. Never show preserved JSON counts as current data.
+            item.update(documents=0, processed=0, failed=0, pending=0, processing=0)
+            result.append(item)
+            continue
         try:
             status = folder / "kv_store_doc_status.json"
             if status.exists():
@@ -124,7 +162,7 @@ def workspace_metadata(config: Config) -> list[dict[str, Any]]:
     return result
 
 
-def workspace_startup_memory(storage_root: Path, workspace_id: str) -> int:
+def workspace_startup_memory(storage_root: Path, workspace_id: str, storage_backend: str = "file") -> int:
     """Conservative admission estimate; no corpus content is parsed here.
 
     Vector JSON is encoded on disk and is transiently retained while decoding
@@ -140,6 +178,11 @@ def workspace_startup_memory(storage_root: Path, workspace_id: str) -> int:
         raise HTTPException(404, "Unknown workspace; no new workspace was created")
     if not folder.is_dir():
         raise HTTPException(404, "Unknown workspace; no new workspace was created")
+    if storage_backend == "postgres":
+        # Corpus matrices and graph objects remain in PostgreSQL. This fixed
+        # process allowance still participates in host/cgroup admission.
+        load_workspace_manifest(folder / ".postgres-workspace.json", workspace_id)
+        return total
     for file in folder.iterdir():
         if not file.is_file() or file.is_symlink():
             continue
@@ -217,7 +260,11 @@ class WorkerManager:
         self.lock = asyncio.Lock()
         self.sweeper: asyncio.Task | None = None
         self.preserved_backlogs = {item["id"] for item in workspace_metadata(config)
-                                   if item.get("pending") or item.get("processing")}
+                                   if item.get("pending") or item.get("processing") or item.get("preserveBacklog")}
+        self.postgres_inventory = None
+        if config.storage_backend == "postgres":
+            from postgres_inventory import PostgresInventory
+            self.postgres_inventory = PostgresInventory()
         self.closing = False
 
     @staticmethod
@@ -306,10 +353,13 @@ class WorkerManager:
 
     async def inventory(self) -> list[dict[str, Any]]:
         items = await asyncio.to_thread(workspace_metadata, self.config)
+        if self.postgres_inventory is not None:
+            items = await self.postgres_inventory.refresh(items)
         for item in items:
             # Only the queues found before this gateway started are frozen.
             # New, explicitly submitted uploads must remain manageable.
-            if item["id"] not in self.preserved_backlogs and item.get("available"):
+            if (item["id"] not in self.preserved_backlogs and item.get("available")
+                    and not (self.config.storage_backend == "postgres" and item.get("readOnly"))):
                 item["readOnly"] = False
                 item.pop("readOnlyReason", None)
             elif item["id"] in self.preserved_backlogs and item.get("available"):
@@ -425,6 +475,8 @@ class WorkerManager:
         for result in results:
             if isinstance(result, BaseException):
                 self._warning("A workspace did not close cleanly; other shutdowns were still attempted")
+        if self.postgres_inventory is not None:
+            await self.postgres_inventory.close()
 
     async def _wait_ready(self, worker: Worker) -> None:
         deadline = time.monotonic() + self.config.startup_timeout
@@ -455,7 +507,11 @@ class WorkerManager:
                 await self._terminate(worker)
                 worker = None
             if worker is None:
-                memory_needed = await asyncio.to_thread(workspace_startup_memory, self.config.storage_root, workspace_id)
+                if self.config.storage_backend == "postgres":
+                    memory_needed = await asyncio.to_thread(workspace_startup_memory, self.config.storage_root,
+                                                           workspace_id, "postgres")
+                else:
+                    memory_needed = await asyncio.to_thread(workspace_startup_memory, self.config.storage_root, workspace_id)
                 while True:
                     memory_available = available_worker_memory()
                     # Processes that have just spawned may not have loaded any

@@ -16,6 +16,8 @@ Check that its directory is a direct child of the configured storage root, uses 
 
 If existing files sit directly in the storage root, review the [adoption layout](../guides/existing-data.md); discovery expects named child directories.
 
+In PostgreSQL mode, a directory also needs a verified `.postgres-workspace.json` registration in the new control root. An empty directory made by the file initializer alone is not a PostgreSQL workspace. Use the explicit [PostgreSQL migration/registration procedure](../guides/postgresql.md); do not write a manifest by hand.
+
 ## The page opens, but a request returns 503
 
 The selected worker may still be loading, all slots may be busy, or memory admission may have refused its estimated load. Wait for current work to finish and retry. Inspect the selected worker's log if it exits during startup.
@@ -31,8 +33,15 @@ Read its discovery metadata:
 - **Saved dimension mismatch:** restore the original embedding configuration or carry out a separate reviewed re-indexing migration. Matching dimensions alone is not model-identity proof.
 - **Unreadable metadata:** inspect a backup and identify the exact malformed or incompatible record.
 - **Earlier unfinished imports:** compatible search remains available, while mutations are paused. Do not edit statuses solely to suppress the guard.
+- **PostgreSQL unavailable or registration mismatch:** restore connectivity and verify the configured database, identity token, exact workspace mapping, embedding model/dimension, and migration readiness. Do not point the worker at an empty replacement database or copy a manifest from another installation.
 
 See [existing-data adoption](../guides/existing-data.md) before attempting recovery.
+
+## PostgreSQL startup or vector search fails
+
+Check that the container can reach `POSTGRES_HOST:POSTGRES_PORT`, that the intended dedicated database contains both `vector` and `vchord`, and that its VectorChord library was preloaded by the database service. Confirm migration verification and the actual VCHORDRQ indexes rather than relying on a successful application process start. Use `VCHORDRQ` with the recorded embedding identity; changing to `HNSW` does not support a 3072-dimensional full-precision vector index.
+
+If custom probes are configured, their hierarchy must match the index's partition options. Start without custom build/probe overrides until representative recall and latency checks justify them. Inspect bounded database activity and index-build resource use without publishing connection strings, vectors, source contents, or query text.
 
 ## The worker refuses its concurrency budget
 

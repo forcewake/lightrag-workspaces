@@ -4,7 +4,7 @@
 
 **Separate corpora. One place to work.**
 
-A community extension for [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG) that adds a workspace selector to the browser interface and workspace routing to the API. Each corpus keeps its own directory and runs in its own worker process when needed.
+A community extension for [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG) that adds a workspace selector to the browser interface and workspace routing to the API. Store corpora in local files or **PostgreSQL with VectorChord**, with a separate worker process for each active workspace.
 
 [Documentation](https://forcewake.github.io/lightrag-workspaces/) · [Installation](docs/getting-started/installation.md) · [API guide](docs/guides/api.md) · [Existing data](docs/guides/existing-data.md) · [Русский](README.ru.md)
 
@@ -19,6 +19,7 @@ A community extension for [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG) th
 - **Workers loaded on demand**, a bounded active pool, idle eviction, and protection for active requests and streams.
 - **Existing directory names preserved**, with startup compatibility writes disabled and unfinished legacy imports held for inspection.
 - **Lower transient vector-loading memory** through a bounded loader for the pinned NanoVectorDB format. Memory admission remains an estimate; set a container limit.
+- **PostgreSQL + VCHORDRQ storage**, including a verified importer for existing JSON, NanoVectorDB, and GraphML data. Exact workspace names and both API selectors stay the same.
 
 ## Quick start
 
@@ -61,26 +62,27 @@ If you enable API authentication, add the configured `X-API-Key` or bearer token
 
 **Stop the old writer and take a verified backup first.** Test this extension against an independent copy before changing the original deployment. Do not change embedding models, rename folders, or allow two services to write the same corpus. Follow the [adoption guide](docs/guides/existing-data.md) and keep the [rollback procedure](docs/guides/backup-and-rollback.md) available.
 
-An old unfinished import queue makes that workspace read-only for changes; compatible search remains available. Existing failed documents are not silently retried. Startup preservation does not make later explicit uploads, queries, or deletions byte-preserving operations.
+An old unfinished import queue makes that workspace read-only for changes; compatible search remains available. Existing failed documents are not silently retried. Startup preservation does not make later explicit uploads, queries, or deletions byte-preserving operations. For a database deployment, follow the dedicated [PostgreSQL migration guide](docs/guides/postgresql.md); the file adoption recipe does not migrate a database.
 
 ## Compatibility and boundaries
 
 | Area | Supported here |
 | --- | --- |
 | Upstream | LightRAG **1.5.7**, source and base image pinned |
-| Storage | `JsonKVStorage`, `JsonDocStatusStorage`, `NanoVectorDBStorage`, `NetworkXStorage` |
+| File storage | `JsonKVStorage`, `JsonDocStatusStorage`, `NanoVectorDBStorage`, `NetworkXStorage` |
+| PostgreSQL storage | `PGKVStorage`, `PGDocStatusStorage`, `PGVectorStorage` with `VCHORDRQ`, `PGTableGraphStorage` |
 | Deployment | One gateway process; one local worker process per active corpus |
 | Models | One global provider configuration shared by all workspaces |
 | Access control | Upstream authentication applies globally; workspaces are not per-user permissions |
-| Database backends | PostgreSQL, Neo4j, Qdrant, and other storage adapters are outside this extension's supported contract |
+| Other database backends | Neo4j, Qdrant, and unlisted combinations are outside this extension's supported contract |
 
 Compose binds to `127.0.0.1` by default. A workspace ID is a routing choice, **not a security boundary**. Review [SECURITY.md](SECURITY.md) before sharing an instance or placing it behind a public endpoint.
 
 ## How it works
 
-The gateway discovers direct child directories under the storage root. Selecting a workspace starts a pinned LightRAG process with that directory as `WORKING_DIR` and a separate input directory. The gateway keeps a lease for each request, including the lifetime of a streamed response, and retires only workers proven idle. Large cold loads may take up to the configured startup deadline.
+The gateway discovers direct child directories under the storage root. File mode opens corpus files; PostgreSQL mode accepts only verified registration manifests in a separate control root and checks live database identity and document counts. Selecting a workspace starts a pinned LightRAG process with its own input directory and database namespace. The gateway keeps a lease for each request, including the lifetime of a streamed response, and retires only workers proven idle.
 
-The extension preserves exact folder names instead of passing them through upstream workspace-name normalization. It intercepts known startup compatibility hooks for this specific version; it does not migrate old data or make cross-version compatibility promises. Read the [architecture and limits](docs/reference/architecture.md).
+The extension preserves exact public workspace names instead of passing them through upstream workspace-name normalization. PostgreSQL uses a deterministic hashed internal namespace, preventing names such as `meeting-notes` and `meeting_notes` from colliding. Migration is an explicit offline command; ordinary startup does not migrate data. Read the [architecture and limits](docs/reference/architecture.md).
 
 ## Development
 

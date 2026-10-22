@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one existing file-backed LightRAG 1.5.7 corpus in its own process.
+"""Run one existing LightRAG 1.5.7 workspace in its own process.
 
 The public workspace name selects a directory; LightRAG's internal namespace
 stays empty so legacy names (including hyphens) are never rewritten. Starting a
@@ -18,6 +18,7 @@ query actually changes that cache.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import fcntl
 import functools
@@ -28,6 +29,11 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Callable, Iterator
+
+from postgres_backend import (
+    POSTGRES_STORAGES, configure_postgres_workspace, install_postgres_vector_namespace, selected_backend,
+    validate_postgres_readiness,
+)
 
 
 WORKSPACE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
@@ -367,22 +373,28 @@ def flatten_legacy_cache(data: dict[str, Any], make_key: Callable[..., str]) -> 
     return converted
 
 
-def install_startup_preservation() -> None:
+def install_startup_preservation(*, file_backends: bool = True) -> None:
     """Patch only 1.5.7 startup compatibility hooks, keeping API writes intact."""
     from lightrag import __version__
-    from lightrag.kg import json_doc_status_impl, json_kv_impl, nano_vector_db_impl, networkx_impl
     from lightrag.storage_migrations import _StorageMigrationMixin
-    from lightrag.utils import generate_cache_key, logger
+    from lightrag.utils import logger
 
     if __version__ != SUPPORTED_VERSION:
         raise RuntimeError(f"Worker requires LightRAG {SUPPORTED_VERSION}; found {__version__}")
     if not inspect.iscoroutinefunction(_StorageMigrationMixin.check_and_migrate_data):
         raise RuntimeError("Unsupported LightRAG migration hook")
-    if not inspect.iscoroutinefunction(json_kv_impl.JsonKVStorage._migrate_legacy_cache_structure):
-        raise RuntimeError("Unsupported LightRAG cache migration hook")
-
     async def skip_startup_backfill(self: Any) -> None:
         logger.info("Workspace startup compatibility backfills are disabled; existing indexes retained")
+
+    _StorageMigrationMixin.check_and_migrate_data = skip_startup_backfill
+    if not file_backends:
+        return
+
+    from lightrag.kg import json_doc_status_impl, json_kv_impl, nano_vector_db_impl, networkx_impl
+    from lightrag.utils import generate_cache_key
+
+    if not inspect.iscoroutinefunction(json_kv_impl.JsonKVStorage._migrate_legacy_cache_structure):
+        raise RuntimeError("Unsupported LightRAG cache migration hook")
 
     async def cache_compatibility_in_memory(self: Any, data: dict[str, Any]) -> dict[str, Any]:
         return flatten_legacy_cache(data, generate_cache_key)
@@ -391,7 +403,6 @@ def install_startup_preservation() -> None:
         # These aliases are used only by the file storage constructors.
         return None
 
-    _StorageMigrationMixin.check_and_migrate_data = skip_startup_backfill
     json_kv_impl.JsonKVStorage._migrate_legacy_cache_structure = cache_compatibility_in_memory
     for module in (json_kv_impl, json_doc_status_impl, nano_vector_db_impl, networkx_impl):
         if not callable(getattr(module, "reap_orphan_tmp_files", None)):
@@ -463,6 +474,10 @@ def run_worker(args: argparse.Namespace) -> None:
     input_directory = resolve_input_directory(args.input_root, args.workspace_id)
     runtime = Path(os.environ.get("LIGHTRAG_MULTIWORKSPACE_RUNTIME", DEFAULT_RUNTIME_ROOT)).resolve()
     with workspace_lock(runtime, args.storage_root, args.workspace_id):
+        backend = selected_backend()
+        if backend == "postgres":
+            manifest = configure_postgres_workspace(selected, args.workspace_id)
+            asyncio.run(validate_postgres_readiness(manifest))
         log_dir = runtime / "logs" / args.workspace_id
         log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         input_directory.mkdir(parents=True, exist_ok=True)
@@ -479,15 +494,18 @@ def run_worker(args: argparse.Namespace) -> None:
         os.environ.pop("LIGHTRAG_GUNICORN_MODE", None)
         # LightRAG initializes its own parser lazily. Do not feed it our argv.
         sys.argv = ["lightrag-server"]
-        install_startup_preservation()
-        install_bounded_nano_loader()
+        install_startup_preservation(file_backends=backend == "file")
+        if backend == "file":
+            install_bounded_nano_loader()
+        else:
+            install_postgres_vector_namespace()
 
         from lightrag.api import lightrag_server as server
         from lightrag.api.config import global_args, update_uvicorn_mode_config
         from lightrag import ROLES
         import uvicorn
 
-        expected_storages = {
+        expected_storages = POSTGRES_STORAGES if backend == "postgres" else {
             "kv_storage": "JsonKVStorage",
             "doc_status_storage": "JsonDocStatusStorage",
             "vector_storage": "NanoVectorDBStorage",
@@ -495,7 +513,7 @@ def run_worker(args: argparse.Namespace) -> None:
         }
         for name, expected in expected_storages.items():
             if getattr(global_args, name) != expected:
-                raise RuntimeError(f"Worker requires {name}={expected} for directory isolation")
+                raise RuntimeError(f"Worker requires {name}={expected} for {backend} workspace isolation")
         apply_provider_budgets(global_args,
                                int(os.environ.get("LIGHTRAG_WORKER_BUDGET_DIVISOR", "1")), ROLES)
         global_args.ssl = False

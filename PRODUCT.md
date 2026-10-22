@@ -12,10 +12,10 @@ Python gateway and worker launcher around pinned LightRAG 1.5.7. The upstream Re
 Self-hosters and developers who maintain several independent document corpora and want one browser interface and one API address. This audience and use scene are inferred from the requested public release and the implementation, rather than market research.
 
 ## Product Purpose
-Select an existing corpus in the interface or in an API request while retaining its exact data directory. A successful installation makes selection explicit, keeps ingestion and streaming requests attached to the selected corpus, and explains compatibility limits before existing data is adopted.
+Select an existing corpus in the interface or in an API request while retaining its exact public identity. Store it in files or migrate it explicitly to PostgreSQL + VectorChord. A successful installation keeps ingestion and streaming requests attached to the selected corpus and explains compatibility limits before existing data is adopted.
 
 ## Positioning
-A community extension for the pinned LightRAG server. The gateway discovers corpus directories and starts an individual upstream process for each active corpus. It adds selection and process lifecycle management; it is not an upstream LightRAG release.
+A community extension for the pinned LightRAG server. The gateway discovers file corpora or verified PostgreSQL control registrations and starts an individual upstream process for each active corpus. It adds selection, process lifecycle management, and explicit data migration; it is not an upstream LightRAG release.
 
 ## Operating Context
 Docker Compose on a private host, with optional Unraid adoption. LLM, embedding, and reranking providers are configured globally. Existing storage must be backed up before first use. Documentation and examples contain synthetic corpus names only.
@@ -23,7 +23,8 @@ Docker Compose on a private host, with optional Unraid adoption. LLM, embedding,
 ## Capabilities and Constraints
 - One browser selector and workspace-aware API routes and headers.
 - Existing direct child directories are discovered; an unknown API identifier never creates data.
-- Supported storage is JsonKVStorage, JsonDocStatusStorage, NanoVectorDBStorage, and NetworkXStorage.
+- File storage uses JsonKVStorage, JsonDocStatusStorage, NanoVectorDBStorage, and NetworkXStorage; PostgreSQL uses PGKVStorage, PGDocStatusStorage, PGVectorStorage/VCHORDRQ, and PGTableGraphStorage.
+- PostgreSQL migration preserves exact public workspace IDs, imports existing embeddings without provider calls, verifies data, and retains original records and source copies.
 - A bounded worker pool loads corpora on demand and preserves busy requests and streams.
 - Old unfinished ingestion queues remain paused, with searches allowed where metadata is compatible.
 - Workspace selection is not user authorization or a tenant security boundary. Provider configuration is shared.

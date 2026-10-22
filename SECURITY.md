@@ -38,6 +38,14 @@ Do not mount the Docker socket or unrelated host directories. Workspace IDs are
 validated and workspace-directory symlinks are rejected; local filesystem
 writers still share the container's trust boundary.
 
+PostgreSQL mode uses one shared database role and deterministic per-workspace
+namespaces. They preserve routing and data identity, not hostile-tenant access
+control. Keep database credentials private and use a dedicated database.
+The migration archive retains original record values separately from native
+working tables. Deleting or reprocessing a document through the API does not
+erase historical migration archives, original source snapshots, or backups.
+Include those copies in the operator's retention and disposal policy.
+
 Documents and retrieved text can contain instructions supplied by other people.
 Treat model output as untrusted. Configured model or parser providers may receive
 document content or query text; their policies and credentials are managed by

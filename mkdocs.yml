@@ -63,6 +63,8 @@ nav:
       - File processing: guides/file-processing.md
   - Bring existing data:
       - Adopt an installation: guides/existing-data.md
+      - PostgreSQL + VectorChord: guides/postgresql.md
+      - PostgreSQL на русском: guides/postgresql.ru.md
       - Unraid: guides/unraid.md
       - Backup and rollback: guides/backup-and-rollback.md
   - Operate:

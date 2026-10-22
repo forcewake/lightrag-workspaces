@@ -166,6 +166,16 @@ class StartupHookTests(unittest.TestCase):
         with patch.dict(sys.modules, modules), self.assertRaises(RuntimeError):
             worker.install_startup_preservation()
 
+    def test_postgres_startup_skips_backfill_without_patching_file_storages(self):
+        modules, migrations, kv = self.fake_modules()
+        original = kv._migrate_legacy_cache_structure
+        with patch.dict(sys.modules, modules):
+            worker.install_startup_preservation(file_backends=False)
+            asyncio.run(migrations().check_and_migrate_data())
+            self.assertIs(kv._migrate_legacy_cache_structure, original)
+            with self.assertRaisesRegex(AssertionError, "remove a corpus file"):
+                modules["lightrag.kg.json_kv_impl"].reap_orphan_tmp_files("retained.tmp")
+
     def test_identity_preserves_storage_namespace(self):
         async def health(request=None):
             return {"status": "healthy", "configuration": {"workspace": ""}}
