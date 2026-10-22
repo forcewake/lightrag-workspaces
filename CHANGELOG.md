@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 — 2026-10-22
+
+- Native Markdown pipe-table headers are included in the table body before sidecar hashing, chunking, table analysis and embedding. Literal column labels remain available even when table analysis is disabled or its generated description omits them.
+- Small and header-only tables retain their headers; oversized table slices reuse the pinned chunker's header handling and token limits. HTML tables keep their original header/span representation.
+- The compatibility hook verifies the exact upstream adapter source and LightRAG version, performs no startup corpus migration, and retains structured header metadata.
+- Synthetic regression checks exercise the actual pinned parser, sidecar writer and paragraph chunker without provider calls. Existing documents require a separately backed-up reindex operation to gain the new searchable text.
+
 ## 0.2.1 — 2026-10-22
 
 - Configurable `LIGHTRAG_LEGACY_STORAGE_WORKSPACE` keeps browser conversations and settings attached to their original workspace when the UI/API default changes.

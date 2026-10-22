@@ -65,6 +65,8 @@ jobs:
           persist-credentials: false
       - name: Build the pinned runtime and frontend from source
         run: docker build -t lightrag-workspaces:ci .
+      - name: Verify native table headers through the pinned parser and chunker
+        run: python3 scripts/smoke_table_headers.py --engine docker --image lightrag-workspaces:ci
       - name: Verify real workers with disposable data and no network
         run: python3 scripts/smoke_container.py --engine docker --image lightrag-workspaces:ci
       - name: Start an isolated PostgreSQL and VectorChord fixture

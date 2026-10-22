@@ -67,6 +67,8 @@ curl http://localhost:9621/query \
 
 [Перенос данных](docs/guides/existing-data.md) · [Unraid](docs/guides/unraid.md) · [Резервное копирование и откат](docs/guides/backup-and-rollback.md)
 
+С **0.2.2** native-парсер Markdown включает заголовки колонок в текст до построения chunks и embeddings. Это действует для новых разборов; уже созданные индексы обновляются отдельной операцией с резервной копией. Подробности — в [руководстве по обработке файлов](docs/guides/file-processing.md#search-table-column-labels).
+
 ## Ограничения
 
 - Закреплён **LightRAG 1.5.7**. Обновлять upstream нужно после проверки совместимости.

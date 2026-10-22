@@ -5,6 +5,7 @@
 !frontend.patch
 !gateway.py
 !worker.py
+!table_headers.py
 !postgres_backend.py
 !postgres_inventory.py
 !migrate_postgres.py
