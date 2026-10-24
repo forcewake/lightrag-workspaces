@@ -9,7 +9,7 @@ RUN bash ./build_frontend.sh /build/webui
 
 # The worker preservation hooks deliberately support this LightRAG release only.
 FROM ghcr.io/hkuds/lightrag@sha256:5bdbd524931b011df246fe20888d110cef691e6804c12cde636a2b746d7de27e AS runtime
-ARG VERSION=0.3.0
+ARG VERSION=0.3.1
 ARG REVISION=development
 LABEL org.opencontainers.image.source="https://github.com/forcewake/lightrag-workspaces" \
       org.opencontainers.image.version=$VERSION \

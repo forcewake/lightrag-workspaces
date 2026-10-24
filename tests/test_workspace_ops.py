@@ -4,6 +4,7 @@ WORKSPACE_OPS_INTEGRATION=1 enables a disposable Docker-only test. It creates
 owned network-none PostgreSQL containers, never a live deployment connection.
 """
 import copy
+import hashlib
 import io
 import json
 import os
@@ -169,6 +170,58 @@ class OperationTests(unittest.TestCase):
         transaction = self.operations.transaction("00000003-0000001B-1")
         self.assertIn("REPEATABLE READ READ ONLY", transaction)
         self.assertIn("SET TRANSACTION SNAPSHOT", transaction)
+
+    def test_fingerprint_algorithm_selector_preserves_v1_and_pins_v2_serialization(self):
+        old = self.operations.transaction(algorithm=ops.FINGERPRINT_V1)
+        self.assertEqual(old, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;"
+                             "SET LOCAL statement_timeout='30min';SET LOCAL extra_float_digits=3;")
+        new = self.operations.transaction()
+        for setting in ("TimeZone='UTC'", "DateStyle='ISO,YMD'", "IntervalStyle='postgres'", "bytea_output='hex'"):
+            self.assertIn("SET LOCAL " + setting, new)
+            self.assertNotIn(setting, old)
+        with patch.object(self.operations, "sql") as sql:
+            with self.assertRaisesRegex(RuntimeError, "Unsupported database fingerprint"):
+                self.operations.fingerprint(algorithm="unknown")
+            sql.assert_not_called()
+
+    def test_v2_digest_stream_retains_duplicate_rows_and_rejects_malformed_or_missing_lines(self):
+        line = hashlib.sha256(b"synthetic row").hexdigest().encode() + b"\n"
+        def streamed(data, count):
+            return ops.hash_command([sys.executable, "-c", "import sys;sys.stdout.buffer.write(" + repr(data) + ")"],
+                                    b"", expected_rows=count)
+        self.assertEqual(streamed(line + line, 2), hashlib.sha256(line + line).hexdigest())
+        self.assertNotEqual(streamed(line + line, 2), streamed(line, 1))
+        self.assertEqual(streamed(b"", 0), hashlib.sha256(b"").hexdigest())
+        for malformed, count in ((line, 2), (line[:-1], 1), (b"z" * 64 + b"\n", 1), (line + b"\n", 2)):
+            with self.assertRaisesRegex(RuntimeError, "digest framing|count/framing"):
+                streamed(malformed, count)
+
+    def test_fingerprint_comparisons_reject_mixed_or_unknown_algorithms(self):
+        payload = {"algorithm": ops.FINGERPRINT_V1, "schema": {"indexes": None}, "tables": []}
+        def seal(value): return value | {"sha256": ops.digest(value)}
+        for algorithm in (ops.FINGERPRINT_V2, "unknown"):
+            for compare in (lambda a, b: ops.compare_restored_fingerprint(a, b),
+                            lambda a, b: ops.compare_restored_service_fingerprint(a, b, [])):
+                with self.assertRaises(RuntimeError): compare(seal(payload), seal(payload | {"algorithm": algorithm}))
+
+    def test_restore_rejects_unknown_or_unbound_fingerprint_before_creating_resources(self):
+        payload = {"algorithm": ops.FINGERPRINT_V2, "schema": {}, "tables": []}
+        sealed = payload | {"sha256": ops.digest(payload)}
+        variants = [
+            (sealed | {"algorithm": "unknown"}, sealed["sha256"]),
+            (sealed | {"sha256": "invalid"}, "invalid"),
+            (sealed, "different-backup"),
+        ]
+        for receipt, bound_checksum in variants:
+            ops.save(self.root / "database-fingerprint.json", receipt)
+            with self.subTest(receipt=receipt, bound_checksum=bound_checksum), \
+                 patch.object(self.operations, "verify_bundle", return_value={"database_sha256": bound_checksum}), \
+                 patch.object(self.operations, "operation") as operation, \
+                 patch.object(self.operations, "docker") as docker:
+                with self.assertRaisesRegex(RuntimeError, "fingerprint"):
+                    self.operations.restore_drill(self.root)
+                operation.assert_not_called()
+                docker.assert_not_called()
 
     def test_restore_allows_only_absent_invalid_source_index_and_records_definition(self):
         value = {"algorithm": "sorted-jsonb-copy-sha256-v1", "tables": [{"table": "example", "count": 2, "sha256": "rows"}],
@@ -431,7 +484,52 @@ class SnapshotIntegration(unittest.TestCase):
                 # pg_dump omits it. No system catalog changes or live data used.
                 with self.assertRaises(RuntimeError):
                     operation.sql("CREATE UNIQUE INDEX CONCURRENTLY synthetic_invalid_index ON synthetic_index_fixture(duplicate_value);")
+                self.assertIn("sha256(bytea)", operation.sql("SELECT to_regprocedure('pg_catalog.sha256(bytea)')::text;"))
+                operation.sql("CREATE TABLE synthetic_wide_rows(id integer,payload text,at timestamptz,span interval,raw bytea);"
+                    "INSERT INTO synthetic_wide_rows SELECT g%1000,repeat(md5((g%1000)::text),512),"
+                    "TIMESTAMPTZ '2020-06-01 12:34:56+00',INTERVAL '1 year 2 mons 3 days 04:05:06',decode('00ff','hex') "
+                    "FROM generate_series(1,2000) g;")
+                transaction = operation.transaction
+                def low_limit(snapshot=None, *, algorithm=ops.FINGERPRINT_V2):
+                    return transaction(snapshot, algorithm=algorithm) + (
+                        "SET LOCAL work_mem='64kB';SET LOCAL temp_file_limit='512kB';"
+                        "SET LOCAL max_parallel_workers_per_gather=0;")
+                old_query = low_limit(algorithm=ops.FINGERPRINT_V1) + (
+                    "COPY (SELECT to_jsonb(t)::text FROM synthetic_wide_rows t "
+                    "ORDER BY to_jsonb(t)::text COLLATE \"C\") TO STDOUT;COMMIT;")
+                old_sort = subprocess.run(operation.psql_args(), input=old_query.encode(), capture_output=True, timeout=120)
+                self.assertNotEqual(old_sort.returncode, 0)
+                self.assertIn(b"temp_file_limit", old_sort.stderr, "Old full-row sort must fail specifically on the test limit")
+                with patch.object(operation, "transaction", side_effect=low_limit):
+                    bounded = operation.fingerprint()
+                wide = next(row for row in bounded["tables"] if row["table"] == "synthetic_wide_rows")
+                self.assertEqual(wide["count"], 2000)
+                self.assertEqual(bounded["algorithm"], ops.FINGERPRINT_V2)
+                # A different host/session's display settings must not change v2.
+                def foreign_settings(snapshot=None, *, algorithm=ops.FINGERPRINT_V2):
+                    return ("SET TimeZone='America/Los_Angeles';SET DateStyle='SQL,DMY';"
+                            "SET IntervalStyle='sql_standard';SET bytea_output='escape';") + low_limit(snapshot, algorithm=algorithm)
+                with patch.object(operation, "transaction", side_effect=foreign_settings):
+                    self.assertEqual(operation.fingerprint(), bounded)
+                operation.sql("BEGIN;CREATE TEMP TABLE shuffled AS SELECT * FROM synthetic_wide_rows ORDER BY id DESC;"
+                    "TRUNCATE synthetic_wide_rows;INSERT INTO synthetic_wide_rows SELECT * FROM shuffled;COMMIT;")
+                with patch.object(operation, "transaction", side_effect=low_limit):
+                    self.assertEqual(operation.fingerprint(), bounded)
+                    operation.sql("DELETE FROM synthetic_wide_rows WHERE ctid=(SELECT ctid FROM synthetic_wide_rows WHERE id=0 LIMIT 1);")
+                    fewer = operation.fingerprint()
+                    fewer_wide = next(row for row in fewer["tables"] if row["table"] == "synthetic_wide_rows")
+                    self.assertEqual(fewer_wide["count"], 1999)
+                    self.assertNotEqual(fewer_wide["sha256"], wide["sha256"])
+                    operation.sql("INSERT INTO synthetic_wide_rows SELECT * FROM synthetic_wide_rows WHERE id=0 LIMIT 1;")
+                    self.assertEqual(operation.fingerprint(), bounded)
+                    operation.sql("UPDATE synthetic_wide_rows SET payload=payload||'changed' "
+                                  "WHERE ctid=(SELECT ctid FROM synthetic_wide_rows WHERE id=0 LIMIT 1);")
+                    changed = operation.fingerprint()
+                    changed_wide = next(row for row in changed["tables"] if row["table"] == "synthetic_wide_rows")
+                    self.assertEqual(changed_wide["count"], 2000)
+                    self.assertNotEqual(changed_wide["sha256"], wide["sha256"])
                 baseline = operation.fingerprint()
+                legacy_baseline = operation.fingerprint(algorithm=ops.FINGERPRINT_V1)
                 invalid = next(index for index in baseline["schema"]["indexes"] if index["indexname"] == "synthetic_invalid_index")
                 self.assertIs(invalid["indisvalid"], False)
                 with operation.snapshot() as snapshot:
@@ -452,6 +550,8 @@ class SnapshotIntegration(unittest.TestCase):
                 restored = operation.fingerprint(container=prefix + "-restore")
                 comparison = ops.compare_restored_fingerprint(baseline, restored)
                 self.assertEqual(comparison["omitted_invalid_source_indexes"], [invalid])
+                legacy_restored = operation.fingerprint(container=prefix + "-restore", algorithm=ops.FINGERPRINT_V1)
+                self.assertEqual(ops.compare_restored_fingerprint(legacy_baseline, legacy_restored)["omitted_invalid_source_indexes"], [invalid])
                 corrupt = root / "corrupt.dump"
                 corrupt.write_bytes(dump.read_bytes()[:-64])
                 with self.assertRaises(RuntimeError):
