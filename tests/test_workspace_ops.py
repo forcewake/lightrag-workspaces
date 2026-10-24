@@ -216,6 +216,38 @@ class OperationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "expected_postgres_id"):
             self.operations.require_source_pins(app, {"Id": "c" * 64})
 
+    def test_restored_worker_may_only_recreate_exact_declared_invalid_index(self):
+        valid = {"tablename": "example", "indexname": "existing", "indexdef": "CREATE INDEX existing ON example(id)",
+                 "indisvalid": True, "indisready": True}
+        omitted = {"tablename": "example", "indexname": "omitted", "indexdef": "CREATE INDEX omitted ON example(created_at)",
+                   "indisvalid": False, "indisready": True}
+        before = {"algorithm": "sorted-jsonb-copy-sha256-v1", "tables": [{"table": "example", "count": 2, "sha256": "rows"}],
+                  "schema": {"indexes": [valid], "columns": [{"column_name": "id"}], "extensions": [{"name": "vector"}]}}
+        def fingerprint(value): return copy.deepcopy(value) | {"sha256": ops.digest(value)}
+        self.assertTrue(ops.compare_restored_service_fingerprint(fingerprint(before), fingerprint(before), [omitted])["schema_unchanged"])
+        after = copy.deepcopy(before)
+        rebuilt = omitted | {"indisvalid": True, "indisready": True}
+        after["schema"]["indexes"].append(rebuilt)
+        result = ops.compare_restored_service_fingerprint(fingerprint(before), fingerprint(after), [omitted])
+        self.assertFalse(result["schema_unchanged"])
+        self.assertEqual(result["recreated_invalid_source_indexes"], [rebuilt])
+        self.assertNotEqual(result["before_sha256"], result["after_sha256"])
+        for mutation in (
+            lambda value: value["schema"]["indexes"][-1].update(indexdef="different definition"),
+            lambda value: value["schema"]["indexes"][-1].update(indisready=False),
+            lambda value: value["schema"]["indexes"][-1].update(indisvalid=False),
+            lambda value: value["schema"]["indexes"][-1].update(indexname="unexpected"),
+            lambda value: value["schema"]["indexes"][0].update(indexdef="changed existing index"),
+            lambda value: value["schema"]["indexes"].pop(0),
+            lambda value: value["tables"][0].update(sha256="changed rows"),
+            lambda value: value["schema"]["columns"][0].update(column_name="changed"),
+        ):
+            changed = copy.deepcopy(after); mutation(changed)
+            with self.assertRaises(RuntimeError):
+                ops.compare_restored_service_fingerprint(fingerprint(before), fingerprint(changed), [omitted])
+        with self.assertRaises(RuntimeError):
+            ops.compare_restored_service_fingerprint(fingerprint(before), fingerprint(after), [])
+
     def test_other_container_writable_parent_mount_blocks_backup(self):
         app = self.container()
         outside = {"Id": "other", "Mounts": [{"RW": True, "Source": str(self.root)}]}

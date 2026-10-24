@@ -77,6 +77,33 @@ def compare_restored_fingerprint(source, restored):
             "omission_reason": "pg_dump excludes invalid source indexes" if omitted else None}
 
 
+def compare_restored_service_fingerprint(before, after, omitted_invalid_indexes):
+    """Permit only native recreation of the exact declared omitted indexes."""
+    expected, actual = copy.deepcopy(before), copy.deepcopy(after)
+    for value in (expected, actual):
+        checksum = value.pop("sha256", None)
+        require(value.get("algorithm") == "sorted-jsonb-copy-sha256-v1" and checksum == digest(value),
+                "Invalid database fingerprint receipt")
+    identities = {(index["tablename"], index["indexname"]) for index in expected["schema"].get("indexes") or []}
+    permitted = {(index["tablename"], index["indexname"]): index for index in omitted_invalid_indexes
+                 if index.get("indisvalid") is False}
+    retained, recreated = [], []
+    for index in actual["schema"].get("indexes") or []:
+        identity = index["tablename"], index["indexname"]
+        if identity not in identities:
+            source = permitted.get(identity)
+            require(source is not None and index == source | {"indisvalid": True, "indisready": True},
+                    "Restored service added an unexpected or changed index")
+            recreated.append(copy.deepcopy(index))
+        else:
+            retained.append(index)
+    actual["schema"]["indexes"] = retained or None
+    require(expected == actual, "Restored service changed corpus rows or remaining schema")
+    return {"before_sha256": before["sha256"], "after_sha256": after["sha256"],
+            "database_rows_matched": True, "remaining_schema_matched": True,
+            "schema_unchanged": not recreated, "recreated_invalid_source_indexes": recreated}
+
+
 def sha256(path):
     result = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -841,15 +868,22 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
                     "Restored workspace inventory differs")
             service = self.scoped_checks(appname)
             save(directory / "service-proof.json", service)
-            require(self.fingerprint(container=dbname, user="postgres") == restored,
-                    "Read-only restored workspace checks changed corpus rows/schema")
+            after_service = self.fingerprint(container=dbname, user="postgres")
+            service_comparison = compare_restored_service_fingerprint(
+                restored, after_service, comparison["omitted_invalid_source_indexes"])
+            save(directory / "after-service-fingerprint.json", after_service)
+            save(directory / "after-service-comparison.json", service_comparison)
             self.stage(directory, record, "verified", status="verified", restore_tested=True,
                        isolated=True, extensions_matched=True, files_matched=True, scoped_ui_api=True,
                        omitted_invalid_source_indexes=comparison["omitted_invalid_source_indexes"],
+                       recreated_invalid_source_indexes=service_comparison["recreated_invalid_source_indexes"],
+                       database_rows_matched=True, schema_unchanged=service_comparison["schema_unchanged"],
                        provider_calls=0, browser_interaction_tested=False,
                        quality_hook="not run; use explicit quality acceptance separately")
             return {"drill": str(directory), "status": "verified", "workspaces": len(service["workspaces"]),
                     "omitted_invalid_source_indexes": comparison["omitted_invalid_source_indexes"],
+                    "recreated_invalid_source_indexes": service_comparison["recreated_invalid_source_indexes"],
+                    "schema_unchanged": service_comparison["schema_unchanged"],
                     "restore_tested": True, "browser_interaction_tested": False}
         except BaseException:
             self.stage(directory, record, "failed", status="failed", failure_stage=record["stage"], containers=created)
