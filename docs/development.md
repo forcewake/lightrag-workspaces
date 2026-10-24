@@ -62,6 +62,17 @@ The standard-library helper creates its own temporary volume and containers with
 
 This offline check exercises no model calls, ingestion, answer quality, or browser interaction. Run the separate workload checks below before adopting a real corpus.
 
+## PostgreSQL graph startup regression
+
+```sh
+docker pull postgres:18.3-bookworm
+python scripts/smoke_postgres_startup.py --engine docker --image lightrag-workspaces:local
+```
+
+The helper creates and removes an internal network and an isolated PostgreSQL container with synthetic data, no published ports, no production mounts and no model calls. It first requires the unpatched adapter to reproduce a lock timeout under a held reader transaction. It then starts three independent patched processes twice under the same lock, checks exact workspace selection and client cleanup, and compares all fixture rows and schema. Missing constraints, incompatible columns, noncanonical edges and missing graph tables must fail without startup repair.
+
+Use `--postgres-image` for an already downloaded compatible PostgreSQL image; CI uses the same pinned PostgreSQL/VectorChord fixture image as the migration check. `--module-file postgres_startup.py` tests a local hook against an older pinned application image. Omit it to verify that the new image actually packages the fix.
+
 ## Documentation
 
 ```sh

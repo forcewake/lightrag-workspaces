@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import postgres_backend as pg
@@ -193,13 +193,15 @@ class PostgresReadinessTests(unittest.TestCase):
         async def close(self):
             self.closed = True
 
-    def check(self, **kwargs):
+    def check(self, *, graph_error=None, **kwargs):
         connection = self.Connection(self.manifest, **kwargs)
         async def connect(**options):
             self.assertEqual(options["database"], self.manifest["database"])
             return connection
         try:
-            asyncio.run(pg.validate_postgres_readiness(self.manifest, env=self.env, connect=connect))
+            with patch("postgres_backend.validate_postgres_graph_schema", new=AsyncMock(side_effect=graph_error)) as graph:
+                asyncio.run(pg.validate_postgres_readiness(self.manifest, env=self.env, connect=connect))
+                graph.assert_awaited_once_with(connection, self.manifest["postgres_workspace"])
         finally:
             self.assertTrue(connection.closed)
             self.assertTrue(connection.readonly)
@@ -208,6 +210,10 @@ class PostgresReadinessTests(unittest.TestCase):
 
     def test_completed_migration_is_checked_read_only_and_connection_closed(self):
         self.check()
+
+    def test_incompatible_graph_refuses_before_native_schema_bootstrap(self):
+        with self.assertRaisesRegex(RuntimeError, "graph incompatible"):
+            self.check(graph_error=RuntimeError("graph incompatible"))
 
     def test_wrong_database_unfinished_rows_missing_tables_or_invalid_indexes_fail_closed(self):
         cases = [{"change_marker": {"db_instance_id": "different"}},

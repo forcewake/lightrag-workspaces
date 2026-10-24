@@ -18,6 +18,8 @@ import ssl
 from typing import Any, Mapping, MutableMapping
 from uuid import UUID
 
+from postgres_startup import validate_postgres_graph_schema
+
 
 MANIFEST_FILENAME = ".postgres-workspace.json"
 MANIFEST_VERSION = 1
@@ -248,6 +250,7 @@ async def validate_postgres_readiness(
                 exists = await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", "public." + table)
                 if not exists:
                     raise RuntimeError(f"PostgreSQL migration is missing table {table}")
+            await validate_postgres_graph_schema(connection, manifest["postgres_workspace"])
             for table in vector_table_names(manifest).values():
                 index = await connection.fetchrow(
                     "SELECT format_type(a.atttypid, a.atttypmod) AS vector_type, "

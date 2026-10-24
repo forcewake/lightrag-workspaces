@@ -7,6 +7,7 @@
 !worker.py
 !table_headers.py
 !postgres_backend.py
+!postgres_startup.py
 !postgres_inventory.py
 !migrate_postgres.py
 !LICENSE

@@ -25,6 +25,12 @@ Migration is explicit. Discovery, the health check, and ordinary startup never i
 
 Unknown store files matching `kv_store_*.json`, `vdb_*.json`, or `graph_*.graphml`, and unsupported GraphML structures, stop migration before a ready registration can be published. Adapt those formats explicitly rather than treating them as imported. Other files, such as source archives or sidecar artifacts, remain in the read-only source and cold backup: the reports list their paths under `retained_source_only_files` per workspace and `retained_source_only_root_files` at the source root. These reported files are not native PostgreSQL records; retain and back them up separately.
 
+## Upgrade an existing PostgreSQL installation
+
+Since **0.2.3**, ordinary graph-worker startup checks the registered schema and canonical edge ordering without running shared-table DDL or legacy normalization. This avoids cold-start lock timeouts caused by redundant schema changes. Incompatible schemas are refused for explicit offline repair. The importer still creates the schema when preparing an owned database.
+
+Finish active processing, take and verify a consistent database and filesystem backup, then recreate only the application with the new image and its existing environment and mounts. Keep the database, exact workspace IDs, control manifests, input directories and browser identity settings. This fix requires no re-embedding, corpus migration or PostgreSQL restart. Verify workspace discovery, selected health, document counts, URL/header API selection and the browser selector after the upgrade; retain the old image for application rollback.
+
 ## Prepare PostgreSQL
 
 Use a **new dedicated empty database**. Do not point the importer at a database already used by another LightRAG installation or another application. The importer records a database identity token and refuses a different target on resume.

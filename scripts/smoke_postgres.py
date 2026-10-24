@@ -245,6 +245,63 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+@contextmanager
+def graph_reader_lock(receipt: dict):
+    """Keep real shared graph reader locks across gateway cold starts/restart."""
+    import asyncpg
+
+    ready, release = threading.Event(), threading.Event()
+    failures = []
+
+    async def hold():
+        connection = await asyncpg.connect(**postgres_connection_kwargs())
+        try:
+            async with connection.transaction(readonly=True):
+                await connection.fetch("SELECT * FROM lightrag_graph_nodes LIMIT 1")
+                await connection.fetch("SELECT * FROM lightrag_graph_edges LIMIT 1")
+                count = await connection.fetchval("""SELECT count(*) FROM pg_locks
+                    WHERE pid=pg_backend_pid() AND granted AND mode='AccessShareLock'
+                      AND relation IN ('lightrag_graph_nodes'::regclass,'lightrag_graph_edges'::regclass)""")
+                if count != 2:
+                    raise AssertionError("Synthetic reader did not hold both graph table locks")
+                ready.set()
+                while not release.is_set():
+                    # A heartbeat detects lost connections, so a vacuous pass
+                    # after silently dropping the reader transaction is impossible.
+                    await connection.fetchval("SELECT 1")
+                    await asyncio.sleep(.25)
+        finally:
+            await connection.close()
+
+    def run():
+        try:
+            asyncio.run(hold())
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            ready.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        if not ready.wait(20):
+            raise RuntimeError("Synthetic graph reader did not become ready")
+        if failures:
+            raise RuntimeError("Synthetic graph reader failed") from failures[0]
+        check(receipt, "shared graph reader locks held before real worker startup", True)
+        yield
+        if failures:
+            raise RuntimeError("Synthetic graph reader lost its transaction") from failures[0]
+        check(receipt, "shared graph reader remained alive through gateway restart and API writes", True)
+    finally:
+        release.set()
+        thread.join(timeout=20)
+        if thread.is_alive():
+            raise RuntimeError("Synthetic graph reader did not stop")
+        if failures:
+            raise RuntimeError("Synthetic graph reader failed") from failures[0]
+
+
 def gateway_checks(base: Path, control: Path, receipt: dict) -> None:
     import httpx
     from lightrag import ROLES
@@ -257,10 +314,11 @@ def gateway_checks(base: Path, control: Path, receipt: dict) -> None:
                EMBEDDING_FUNC_MAX_ASYNC="4", MAX_ASYNC_RERANK="4", MAX_PARALLEL_INSERT="2", RERANK_BINDING="null",
                LLM_BINDING="openai", LLM_BINDING_API_KEY="synthetic", LLM_MODEL=MODEL,
                EMBEDDING_BINDING="openai", EMBEDDING_BINDING_API_KEY="synthetic", EMBEDDING_MODEL=MODEL,
-               EMBEDDING_DIM=str(DIMENSION), EMBEDDING_TOKEN_LIMIT="8192", LIGHTRAG_API_KEY="", AUTH_ACCOUNTS="")
+               EMBEDDING_DIM=str(DIMENSION), EMBEDDING_TOKEN_LIMIT="8192", LIGHTRAG_API_KEY="", AUTH_ACCOUNTS="",
+               POSTGRES_SERVER_SETTINGS="lock_timeout=500ms&statement_timeout=30s")
     env.pop("POSTGRES_WORKSPACE", None)
     log = base / "gateway.log"
-    with fake_provider() as (provider, calls), log.open("wb") as log_stream:
+    with fake_provider() as (provider, calls), log.open("wb") as log_stream, graph_reader_lock(receipt):
         env.update(LLM_BINDING_HOST=provider, EMBEDDING_BINDING_HOST=provider)
         for role in ROLES:
             env.update({f"{role.env_prefix}_LLM_BINDING": "openai", f"{role.env_prefix}_LLM_BINDING_HOST": provider,

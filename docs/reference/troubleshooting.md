@@ -24,6 +24,10 @@ The selected worker may still be loading, all slots may be busy, or memory admis
 
 Check container memory usage, OOM state, restarts, and host memory. Reduce `LIGHTRAG_MAX_ACTIVE_WORKSPACES` to reduce residency, or size the hard memory limit for a measured representative corpus. Increasing a client timeout does not solve insufficient memory.
 
+On extension versions before **0.2.3**, PostgreSQL graph startup repeats schema DDL. A concurrent reader or writer can block that redundant `ALTER TABLE`; the worker log then shows `LockNotAvailableError` / `canceling statement due to lock timeout`, and the gateway reports that the selected workspace could not start. Version 0.2.3 validates the existing graph schema without that DDL. Upgrade the application after taking a consistent backup and finishing active processing. This fix needs no document reindexing or PostgreSQL restart. Other causes of 503 still require the checks above.
+
+If the updated worker reports an incompatible graph schema, inspect the specific missing contract and restore or repair it through a separately verified offline operation. Do not delete the registration or let startup initialize a replacement corpus.
+
 The cold-start deadline is 240 seconds. A reverse proxy or API client with a shorter timeout can disconnect first. Configure the whole path for that wait and for long streamed responses.
 
 ## A workspace returns 409

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 — 2026-10-24
+
+- PostgreSQL graph workers validate the existing schema on startup instead of repeating schema DDL and legacy edge normalization. A reader holding a graph-table lock no longer causes a cold workspace to fail on the redundant `ALTER TABLE`.
+- Missing or incompatible graph schemas fail closed with an offline repair instruction; migration remains an explicit operation. Existing workspace identifiers, UI/API selectors, documents, vectors and graph records are retained.
+- Regression checks cover lock contention, concurrent initialization, pool cleanup, schema rejection and unchanged synthetic graph records.
+
 ## 0.2.2 — 2026-10-22
 
 - Native Markdown pipe-table headers are included in the table body before sidecar hashing, chunking, table analysis and embedding. Literal column labels remain available even when table analysis is disabled or its generated description omits them.

@@ -88,6 +88,10 @@ jobs:
             -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=synthetic-ci-only -e POSTGRES_DATABASE=lightrag_ci \
             --mount "type=bind,src=$PWD/scripts/smoke_postgres.py,dst=/checks/smoke_postgres.py,readonly" \
             --entrypoint python lightrag-workspaces:ci /checks/smoke_postgres.py --target-database lightrag_ci
+      - name: Verify cold PostgreSQL starts under shared graph reader locks
+        run: |
+          python3 scripts/smoke_postgres_startup.py --engine docker --image lightrag-workspaces:ci \
+            --postgres-image tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
       - name: Remove the owned PostgreSQL fixture
         if: always()
         run: |
