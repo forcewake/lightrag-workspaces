@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import stat
@@ -153,6 +154,21 @@ def disjoint(a, b):
     return a != b and a not in b.parents and b not in a.parents
 
 
+def canonical_mounts(mounts):
+    """Ignore Docker's inspection order, preserving every mount field exactly."""
+    require(isinstance(mounts, list), "Container mounts must be a list")
+    destinations = set()
+    for mount in mounts:
+        require(isinstance(mount, dict), "Container mount must be an object")
+        destination = mount.get("Destination")
+        require(isinstance(destination, str) and destination.startswith("/")
+                and not destination.startswith("//") and "\0" not in destination
+                and posixpath.normpath(destination) == destination, "Malformed container mount destination")
+        require(destination not in destinations, "Duplicate container mount destination")
+        destinations.add(destination)
+    return sorted(mounts, key=lambda mount: mount["Destination"])
+
+
 def run(arguments, *, data=None, output=None, timeout=3600):
     # Error output may contain credentials or document text: deliberately do not
     # interpolate it into console errors. A private operation receipt records stage.
@@ -259,7 +275,7 @@ def image_config(old, candidate, *, image):
             "Static networking/links/options need an explicit deployment adapter")
     require(not host.get("AutoRemove") and not host.get("VolumesFrom") and not host.get("ContainerIDFile"),
             "Auto-remove, inherited volumes and container ID files are unsupported")
-    require(all(item.get("Type") == "bind" for item in old["Mounts"]),
+    require(all(item.get("Type") == "bind" for item in canonical_mounts(old["Mounts"])),
             "This update adapter requires explicit bind mounts")
     payload = copy.deepcopy(old["Config"])
     payload.update(Image=image, Entrypoint=candidate["Config"].get("Entrypoint"),
@@ -291,7 +307,8 @@ def require_default_command(container, image):
 
 def validate_retained(original, retained):
     require(retained["Id"] == original["Id"] and retained["Image"] == original["Image"]
-            and retained["Config"] == original["Config"] and retained["Mounts"] == original["Mounts"],
+            and retained["Config"] == original["Config"]
+            and canonical_mounts(retained["Mounts"]) == canonical_mounts(original["Mounts"]),
             "Retained application configuration/mounts changed; do not start it")
     current_host = copy.deepcopy(retained["HostConfig"])
     original_restart = original["HostConfig"]["RestartPolicy"]
@@ -504,7 +521,7 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
     def mount_sources(self, app):
         destinations = self.config.get("mounts", {"control": "/app/data/rag_storage", "inputs": "/app/data/inputs"})
         require(set(destinations) == {"control", "inputs"}, "Define exactly control and inputs authoritative mounts")
-        mounts = {row["Destination"]: row for row in app["Mounts"]}
+        mounts = {row["Destination"]: row for row in canonical_mounts(app["Mounts"])}
         result = {}
         for label, destination in destinations.items():
             require(destination in mounts and mounts[destination]["Type"] == "bind", "Authoritative mount missing/not a bind")
@@ -997,7 +1014,8 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
                 "Candidate needs an image-bound tested compatibility receipt")
         previous = load(Path(bundle) / "application.json")
         require(app["Id"] == previous["Id"] and app["Config"] == previous["Config"]
-                and app["HostConfig"] == previous["HostConfig"] and app["Mounts"] == previous["Mounts"],
+                and app["HostConfig"] == previous["HostConfig"]
+                and canonical_mounts(app["Mounts"]) == canonical_mounts(previous["Mounts"]),
                 "Live application changed since backup")
         require_default_command(app, self.inspect(app["Image"], image=True))
         reference = immutable_reference(candidate, image)
@@ -1054,7 +1072,8 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
             require(self.inspect(self.pg)["Id"] == postgres["Id"] and
                     self.inspect(self.pg)["State"]["StartedAt"] == postgres["State"]["StartedAt"], "PostgreSQL restarted")
             current = self.inspect(self.app)
-            require(current["Image"] == image["Id"] and current["Mounts"] == app["Mounts"]
+            require(current["Image"] == image["Id"]
+                    and canonical_mounts(current["Mounts"]) == canonical_mounts(app["Mounts"])
                     and current["Config"]["Env"] == app["Config"]["Env"], "Candidate identity/configuration differs")
             if self.config.get("unraid_template"):
                 template = Path(self.config["unraid_template"])
@@ -1121,7 +1140,8 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
                 # and prewritten configuration, never an unrelated same-name app.
                 payload = load(directory / "candidate-payload.json")
                 require((current["Config"].get("Labels") or {}).get(OWNER) == record["id"] and
-                        current["Image"] == record["candidate_image"] and current["Mounts"] == original["Mounts"] and
+                        current["Image"] == record["candidate_image"] and
+                        canonical_mounts(current["Mounts"]) == canonical_mounts(original["Mounts"]) and
                         all(current["Config"].get(key) == payload.get(key) for key in
                             ("Image", "Env", "Entrypoint", "Cmd", "Labels")) and
                         current["HostConfig"] == payload["HostConfig"],

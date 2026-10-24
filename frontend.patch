@@ -9,7 +9,7 @@ index 7068c52..dda1247 100644
 +import WorkspaceOpening from '@/components/WorkspaceOpening'
 +import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
 +import { isWorkspaceBootstrapError, type WorkspaceBootstrapError } from '@/api/errors'
- 
+
  import GraphViewer from '@/features/GraphViewer'
  import DocumentManager from '@/features/DocumentManager'
 @@ -34,12 +37,14 @@ function App() {
@@ -24,11 +24,11 @@ index 7068c52..dda1247 100644
    const healthCheckInitializedRef = useRef(false); // Prevent duplicate health checks in Vite dev mode
    const pageRestoreGeneration = usePageRestoreGeneration()
 +  const gatewayWorkspaceId = getRuntimeWorkspaceConfig()?.workspaceId
- 
+
    const handleApiKeyAlertOpenChange = useCallback((open: boolean) => {
      setApiKeyAlertOpen(open)
 @@ -64,6 +69,9 @@ function App() {
- 
+
    // Health check - can be disabled
    useEffect(() => {
 +    // Auth bootstrap already waits for the cold worker. Starting a short
@@ -43,7 +43,7 @@ index 7068c52..dda1247 100644
      };
 -  }, [enableHealthCheck, apiKeyAlertOpen, pageRestoreGeneration]);
 +  }, [enableHealthCheck, apiKeyAlertOpen, pageRestoreGeneration, gatewayWorkspaceId, initializing, workspaceError]);
- 
+
    // Version check - independent and executed only once
    useEffect(() => {
 @@ -158,6 +166,7 @@ function App() {
@@ -99,7 +99,7 @@ index e7f67f3..ccf6c07 100644
 +import axios from 'axios'
  // Dependency-free module — safe to import statically before the mocks below.
  import { isAuthenticationRequiredError } from './errors'
- 
+
 @@ -36,10 +37,9 @@ Object.defineProperty(globalThis, 'sessionStorage', {
  // - navigationService.navigateToUnauthenticated is neutralized with a
  //   RESTORABLE spy (mockRestore in afterAll) so the 401 paths under test
@@ -117,7 +117,7 @@ index e7f67f3..ccf6c07 100644
 @@ -56,36 +56,6 @@ mock.module('@/lib/constants', () => ({
    searchLabelsDefaultLimit: 50,
  }))
- 
+
 -// Mock axios — the module calls axios.create() at top level and
 -// axios.get() in silentRefreshGuestToken
 -mock.module('axios', () => {
@@ -161,7 +161,7 @@ index e7f67f3..ccf6c07 100644
  let authStore: typeof import('@/stores/state').useAuthStore
 @@ -149,14 +120,24 @@ let authStore: typeof import('@/stores/state').useAuthStore
  let restoreMocks: (() => void) | undefined
- 
+
  beforeAll(async () => {
 -  // Dynamic imports AFTER the axios/constants mocks above, so the api module's
 -  // axios instance is the mocked one. These are the REAL store and navigation
@@ -173,7 +173,7 @@ index e7f67f3..ccf6c07 100644
    authStore = (await import('@/stores/state')).useAuthStore
    const { navigationService } = await import('@/services/navigation')
    apiModule = await import('./lightrag')
- 
+
 +  const axiosGetSpy = spyOn(axios, 'get').mockResolvedValue({
 +    data: {
 +      access_token: 'mock-guest-token',
@@ -330,7 +330,7 @@ index 27982d8..88fd19d 100644
 -import { AuthenticationRequiredError, isAuthenticationRequiredError } from '@/api/errors'
 +import { AuthenticationRequiredError, isAuthenticationRequiredError, WorkspaceBootstrapError, isWorkspaceBootstrapError } from '@/api/errors'
 +import { getRuntimeAuthTimeoutMs, getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
- 
+
  // Types
  export type LightragNodeType = {
 @@ -473,7 +474,7 @@ axiosInstance.interceptors.request.use((config) => {
@@ -356,7 +356,7 @@ index 27982d8..88fd19d 100644
  }
 
 @@ -1062,9 +1069,10 @@ export const deleteDocuments = async (
- 
+
  export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
    try {
 -    // Add a timeout to the request to prevent hanging
@@ -379,7 +379,7 @@ index 27982d8..88fd19d 100644
 @@ -1109,14 +1118,28 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
      // If response data is invalid but we got a response, log it
      console.warn('Received invalid auth status response:', response.data);
- 
+
 +    if (getRuntimeWorkspaceConfig()) throw new WorkspaceBootstrapError('invalid_response')
 +
      // Default to auth configured if response is invalid
@@ -1048,10 +1048,10 @@ index 0000000..ba93aa3
 +}
 diff --git a/lightrag_webui/src/components/WorkspaceOpening.test.tsx b/lightrag_webui/src/components/WorkspaceOpening.test.tsx
 new file mode 100644
-index 0000000..502d470
+index 0000000..fe05134
 --- /dev/null
 +++ b/lightrag_webui/src/components/WorkspaceOpening.test.tsx
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,83 @@
 +import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 +import { cleanup, screen } from '@testing-library/react'
 +import userEvent from '@testing-library/user-event'
@@ -1082,7 +1082,8 @@ index 0000000..502d470
 +      expect(screen.getByRole('status')).toHaveTextContent('Opening workspace research…')
 +      expect(screen.getByRole('status')).toHaveTextContent('while your documents load')
 +      expect(screen.queryAllByRole('textbox', { name: /username/i })).toHaveLength(0)
-+      await user.selectOptions(screen.getByRole('combobox', { name: 'Workspace' }), 'default')
++      await user.click(screen.getByRole('button', { name: 'Workspace' }))
++      await user.click(screen.getByRole('option', { name: /default/ }))
 +      expect(assign).toHaveBeenCalledWith('/workspaces/default/webui/')
 +    } finally {
 +      assign.mockRestore()
@@ -1107,7 +1108,7 @@ index 0000000..502d470
 +      renderWithProviders(<WorkspaceOpening error={new WorkspaceBootstrapError('unavailable', 409)} />)
 +      expect(screen.getByRole('alert')).toHaveTextContent('Could not open workspace research')
 +      expect(screen.getByRole('alert')).toHaveTextContent('These documents need their original model settings.')
-+      expect(screen.getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
++      expect(screen.getByRole('button', { name: 'Workspace' })).toBeInTheDocument()
 +      expect(screen.queryAllByRole('textbox')).toHaveLength(0)
 +      await user.click(screen.getByRole('button', { name: 'Try again' }))
 +      expect(reload).toHaveBeenCalledTimes(1)
@@ -1131,7 +1132,7 @@ index 0000000..502d470
 +    renderWithProviders(<WorkspaceOpening error={new WorkspaceBootstrapError('unavailable', 409, 'workspace_registration_invalid', false)} />)
 +    expect(screen.getByRole('alert')).toHaveTextContent('registration needs inspection')
 +    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument()
-+    expect(screen.getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Workspace' })).toBeInTheDocument()
 +  })
 +})
 diff --git a/lightrag_webui/src/components/WorkspaceOpening.tsx b/lightrag_webui/src/components/WorkspaceOpening.tsx
@@ -1240,14 +1241,15 @@ index 0000000..1637d90
 +}
 diff --git a/lightrag_webui/src/components/WorkspaceSelector.test.tsx b/lightrag_webui/src/components/WorkspaceSelector.test.tsx
 new file mode 100644
-index 0000000..0927801
+index 0000000..8b0411d
 --- /dev/null
 +++ b/lightrag_webui/src/components/WorkspaceSelector.test.tsx
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,257 @@
 +import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-+import { cleanup, screen } from '@testing-library/react'
++import { cleanup, fireEvent, screen, waitFor, within } from '@testing-library/react'
 +import userEvent from '@testing-library/user-event'
 +import { renderWithProviders } from '@/test/render'
++import { WORKSPACE_FAVORITES_KEY } from '@/lib/workspaceCatalog'
 +import WorkspaceSelector from './WorkspaceSelector'
 +import WorkspaceReadOnlyNotice from './WorkspaceReadOnlyNotice'
 +import type { RuntimeWorkspace } from '@/lib/runtimeConfig'
@@ -1255,62 +1257,226 @@ index 0000000..0927801
 +const originalConfig = window.__LIGHTRAG_CONFIG__
 +const originalUrl = window.location.href
 +const workspaces: RuntimeWorkspace[] = [
-+  { id: 'default', documents: 24, processed: 22, failed: 2, pending: 0, processing: 0, readOnly: false },
-+  { id: 'meeting-notes', documents: 221, processed: 0, failed: 0, pending: 220, processing: 1, readOnly: true }
++  { id: 'default', displayName: 'Main library', documents: 24, processed: 22, failed: 2, pending: 0, processing: 0, readOnly: false },
++  { id: 'meeting-notes', displayName: 'Meeting notes', tags: ['marine', 'Blue'], documents: 221, processed: 0, failed: 0, pending: 220, processing: 1, readOnly: true },
++  { id: 'Research.Team_v2', displayName: 'Ocean notes', tags: ['reference'], documents: 8, processed: 8, failed: 0, pending: 0, processing: 0, readOnly: false },
++  { id: 'research.team_v2', displayName: 'Archive notes', tags: ['history'], documents: 6, processed: 6, failed: 0, pending: 0, processing: 0, readOnly: false }
 +]
 +let assign: ReturnType<typeof spyOn<typeof window.location, 'assign'>>
++let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, 'fetch'>>
++let rows: RuntimeWorkspace[]
++const json = () => new Response(JSON.stringify({ workspaces: rows }), { headers: { 'Content-Type': 'application/json' } })
 +
 +beforeEach(() => {
-+  window.__LIGHTRAG_CONFIG__ = { workspaceId: 'default', defaultWorkspace: 'default', workspaces }
++  rows = workspaces.map((row) => ({ ...row }))
++  window.__LIGHTRAG_CONFIG__ = { workspaceId: 'default', defaultWorkspace: 'default', legacyStorageWorkspace: 'meeting-notes', workspaces: rows }
 +  window.history.replaceState(null, '', '/workspaces/default/webui/')
++  localStorage.removeItem(WORKSPACE_FAVORITES_KEY)
 +  assign = spyOn(window.location, 'assign').mockImplementation(() => {})
++  assign.mockClear()
++  fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async () => json()) as unknown as typeof fetch)
++  fetchSpy.mockClear()
 +})
-+
 +afterEach(() => {
 +  cleanup()
-+  assign.mockRestore()
++  assign.mockRestore(); fetchSpy.mockRestore()
++  localStorage.removeItem(WORKSPACE_FAVORITES_KEY)
 +  window.__LIGHTRAG_CONFIG__ = originalConfig
 +  window.history.replaceState(null, '', originalUrl)
 +})
++async function openPicker() {
++  const user = userEvent.setup()
++  renderWithProviders(<WorkspaceSelector />)
++  await user.click(screen.getByRole('button', { name: 'Workspace' }))
++  const search = screen.getByRole('combobox', { name: 'Search workspaces' })
++  await waitFor(() => expect(document.activeElement === search).toBe(true))
++  return { user, search }
++}
++function activeText(input: HTMLElement) {
++  return document.getElementById(input.getAttribute('aria-activedescendant') || '')?.textContent || ''
++}
 +
-+describe('workspace selector', () => {
-+  test('has an accessible name, current selection, document counts and read-only state', () => {
-+    renderWithProviders(<WorkspaceSelector />)
-+    expect(screen.getByRole('combobox', { name: 'Workspace' })).toHaveValue('default')
-+    expect(screen.getByRole('option', { name: 'default (24)' })).toBeInTheDocument()
-+    expect(screen.getByRole('option', { name: 'meeting-notes (221) — read only' })).toBeInTheDocument()
++describe('searchable workspace picker', () => {
++  test('opens a labelled combobox with focus, current selection, counts and selectable read-only corpus', async () => {
++    const { search } = await openPicker()
++    expect(screen.getByRole('button', { name: 'Workspace' })).toHaveAccessibleDescription('Main library (24)')
++    expect(search).toHaveAttribute('aria-expanded', 'true')
++    expect(search.getAttribute('aria-controls')).toBe(screen.getByRole('listbox', { name: 'Workspace' }).id)
++    expect(screen.getByRole('option', { name: /Main library/ })).toHaveAttribute('aria-current', 'true')
++    expect(activeText(search)).toContain('Main library')
++    const readOnly = screen.getByRole('option', { name: /Meeting notes/ })
++    expect(readOnly).toHaveTextContent('read only')
++    expect(readOnly).not.toHaveAttribute('aria-disabled', 'true')
++    expect(within(readOnly).getByLabelText('221 documents')).toBeInTheDocument()
++    expect(document.querySelectorAll('select')).toHaveLength(0)
 +  })
-+
-+  test('switches the admin page by full navigation, keeping the exact workspace name', async () => {
-+    const user = userEvent.setup()
-+    renderWithProviders(<WorkspaceSelector />)
-+    await user.selectOptions(screen.getByRole('combobox', { name: 'Workspace' }), 'meeting-notes')
++  test('searches display names, exact IDs and tags without case sensitivity', async () => {
++    const { user, search } = await openPicker()
++    for (const term of ['MEETING NOTES', 'meeting-NOTES', 'MARINE blue']) {
++      await user.clear(search); await user.type(search, term)
++      expect(screen.getAllByRole('option')).toHaveLength(1)
++      expect(screen.getByRole('option', { name: /Meeting notes/ })).toBeInTheDocument()
++    }
++    await user.clear(search); await user.type(search, 'RESEARCH.TEAM_V2')
++    expect(screen.getAllByRole('option')).toHaveLength(2)
++  })
++  test('switches by exact immutable ID and leaves default, legacy identity and browser storage alone', async () => {
++    const configBefore = JSON.stringify(window.__LIGHTRAG_CONFIG__)
++    localStorage.setItem('webui-retrieval-history', '["keep-this-history"]')
++    localStorage.setItem('settings-storage', '{"theme":"dark"}')
++    const { user, search } = await openPicker()
++    await user.type(search, 'Ocean')
++    await user.click(screen.getByRole('option', { name: /Ocean notes/ }))
 +    expect(assign).toHaveBeenCalledTimes(1)
-+    expect(assign).toHaveBeenCalledWith('/workspaces/meeting-notes/webui/')
-+    // A selection in this tab does not modify the global configuration or a
-+    // persisted choice that would silently retarget requests in another tab.
-+    expect(window.__LIGHTRAG_CONFIG__?.workspaceId).toBe('default')
++    expect(assign).toHaveBeenCalledWith('/workspaces/Research.Team_v2/webui/')
++    expect(JSON.stringify(window.__LIGHTRAG_CONFIG__)).toBe(configBefore)
++    expect(localStorage.getItem('webui-retrieval-history')).toBe('["keep-this-history"]')
++    expect(localStorage.getItem('settings-storage')).toBe('{"theme":"dark"}')
++    expect(fetchSpy.mock.calls.every(([, init]) => init?.method === 'GET')).toBe(true)
++    localStorage.removeItem('webui-retrieval-history'); localStorage.removeItem('settings-storage')
 +  })
-+
-+  test('keeps the query-only entry when switching, without a previous chat route', async () => {
++  test('keeps the lightweight entry and allows searching a preserved read-only corpus', async () => {
 +    window.history.replaceState(null, '', '/workspaces/default/workspace/#/welcome')
-+    const user = userEvent.setup()
-+    renderWithProviders(<WorkspaceSelector />)
-+    await user.selectOptions(screen.getByRole('combobox', { name: 'Workspace' }), 'meeting-notes')
++    const { user, search } = await openPicker()
++    await user.type(search, 'marine')
++    await user.keyboard('{Enter}')
++    expect(assign).toHaveBeenCalledTimes(1)
 +    expect(assign).toHaveBeenCalledWith('/workspaces/meeting-notes/workspace/')
 +  })
-+
-+  test('does not navigate when selecting the current workspace', async () => {
++  test('selecting the current workspace closes and returns focus without navigating', async () => {
++    const { user } = await openPicker()
++    await user.click(screen.getByRole('option', { name: /Main library/ }))
++    expect(assign).not.toHaveBeenCalled()
++    await waitFor(() => expect(screen.queryAllByRole('listbox')).toHaveLength(0))
++    expect(document.activeElement === screen.getByRole('button', { name: 'Workspace' })).toBe(true)
++  })
++  test('puts current then favorites first and reads catalog favorites again on reopening', async () => {
++    localStorage.setItem(WORKSPACE_FAVORITES_KEY, JSON.stringify(['Research.Team_v2']))
++    const { user } = await openPicker()
++    const labels = () => screen.getAllByRole('option').map((row) => row.textContent)
++    expect(labels()[0]).toContain('Main library')
++    expect(labels()[1]).toContain('Ocean notesFavorite')
++    await user.keyboard('{Escape}')
++    localStorage.setItem(WORKSPACE_FAVORITES_KEY, JSON.stringify(['meeting-notes']))
++    await user.click(screen.getByRole('button', { name: 'Workspace' }))
++    expect(labels()[1]).toContain('Meeting notesFavorite')
++  })
++  test('uses Arrow keys, Home, End and Enter while keeping input focus', async () => {
++    const { user, search } = await openPicker()
++    await user.keyboard('{ArrowDown}')
++    expect(activeText(search)).toContain('Archive notes')
++    await user.keyboard('{End}')
++    expect(activeText(search)).toContain('Ocean notes')
++    await user.keyboard('{ArrowUp}')
++    expect(activeText(search)).toContain('Meeting notes')
++    await user.keyboard('{Home}')
++    expect(activeText(search)).toContain('Main library')
++    await user.keyboard('{ArrowDown}{Enter}')
++    expect(assign).toHaveBeenCalledWith('/workspaces/research.team_v2/webui/')
++  })
++  test('opens by keyboard and Escape returns to the trigger; reopening resets only search', async () => {
 +    const user = userEvent.setup()
 +    renderWithProviders(<WorkspaceSelector />)
-+    await user.selectOptions(screen.getByRole('combobox', { name: 'Workspace' }), 'default')
++    const trigger = screen.getByRole('button', { name: 'Workspace' })
++    trigger.focus()
++    await user.keyboard('{ArrowDown}')
++    const search = screen.getByRole('combobox', { name: 'Search workspaces' })
++    await waitFor(() => expect(document.activeElement === search).toBe(true))
++    await user.type(search, 'Ocean'); await user.keyboard('{Escape}')
++    await waitFor(() => expect(document.activeElement === trigger).toBe(true))
++    expect(assign).not.toHaveBeenCalled()
++    await user.keyboard('{Enter}')
++    expect(screen.getByRole('combobox')).toHaveValue('')
++    expect(screen.getAllByRole('option')).toHaveLength(4)
++  })
++  test('explains empty results, never selects a hidden result and clear restores input focus', async () => {
++    const { user, search } = await openPicker()
++    await user.type(search, 'no-such-library')
++    expect(screen.getByText('No workspaces match your search.')).toBeVisible()
++    expect(screen.queryAllByRole('option')).toHaveLength(0)
++    expect(search).not.toHaveAttribute('aria-activedescendant')
++    await user.keyboard('{ArrowDown}{Home}{End}{Enter}')
++    expect(assign).not.toHaveBeenCalled()
++    await user.click(screen.getByRole('button', { name: 'Clear search' }))
++    expect(search).toHaveValue('')
++    expect(document.activeElement === search).toBe(true)
++    expect(screen.getAllByRole('option')).toHaveLength(4)
++  })
++  test('retains a usable snapshot on refresh failure and recovers with one explicit refresh', async () => {
++    fetchSpy.mockImplementation((async () => { throw new Error('offline') }) as unknown as typeof fetch)
++    const { user, search } = await openPicker()
++    await screen.findByText('Showing the last available list. Refresh to check for changes.')
++    await user.type(search, 'Ocean')
++    expect(screen.getByRole('option', { name: /Ocean notes/ })).toBeVisible()
++    rows.push({ ...workspaces[2], id: 'fresh', displayName: 'Ocean fieldwork' })
++    fetchSpy.mockImplementation((async () => json()) as unknown as typeof fetch)
++    const callsBefore = fetchSpy.mock.calls.length
++    await user.click(screen.getByRole('button', { name: 'Refresh workspaces' }))
++    await screen.findByRole('option', { name: /Ocean fieldwork/ })
++    expect(fetchSpy.mock.calls.length).toBe(callsBefore + 1)
++    expect(search).toHaveValue('Ocean')
 +    expect(assign).not.toHaveBeenCalled()
 +  })
-+
++  test('keeps fallback rows usable during loading and shows an empty refreshed catalog honestly', async () => {
++    let resolve!: (response: Response) => void
++    fetchSpy.mockImplementation((() => new Promise<Response>((done) => { resolve = done })) as unknown as typeof fetch)
++    const { search } = await openPicker()
++    expect(screen.getByText('Refreshing workspaces…')).toBeVisible()
++    expect(screen.getAllByRole('option')).toHaveLength(4)
++    rows = []; resolve(json())
++    await screen.findByText('No workspaces are available.')
++    expect(search).not.toHaveAttribute('aria-activedescendant')
++    expect(screen.getByRole('button', { name: 'Workspace' })).toHaveAccessibleDescription('Main library (24)')
++  })
++  test('preserves active identity through refresh, and removes a stale descendant when that row disappears', async () => {
++    const { user, search } = await openPicker()
++    await user.keyboard('{End}')
++    rows = rows.map((row) => row.id === 'Research.Team_v2' ? { ...row, displayName: 'A new title' } : row)
++    await user.click(screen.getByRole('button', { name: 'Refresh workspaces' }))
++    await screen.findByRole('option', { name: /A new title/ })
++    expect(activeText(search)).toContain('A new title')
++    rows = rows.filter((row) => row.id !== 'Research.Team_v2')
++    await user.click(screen.getByRole('button', { name: 'Refresh workspaces' }))
++    await waitFor(() => expect(screen.queryAllByRole('option', { name: /A new title/ })).toHaveLength(0))
++    expect(activeText(search)).toContain('Main library')
++    expect(assign).not.toHaveBeenCalled()
++  })
++  test('does not select while an IME is confirming text', async () => {
++    const { search } = await openPicker()
++    fireEvent.keyDown(search, { key: 'Enter', isComposing: true })
++    expect(screen.getAllByRole('option')).toHaveLength(4)
++    expect(assign).not.toHaveBeenCalled()
++  })
++  test('keeps the management catalog reachable after closing the picker', async () => {
++    const { user } = await openPicker()
++    await user.keyboard('{Escape}')
++    await user.click(screen.getByRole('button', { name: 'Your workspaces' }))
++    expect(screen.getByRole('dialog', { name: 'Your workspaces' })).toBeVisible()
++    expect(screen.getByRole('searchbox', { name: 'Search workspaces' })).toBeVisible()
++  })
++  test('outside click dismisses without stealing focus or navigating', async () => {
++    const user = userEvent.setup()
++    renderWithProviders(<><WorkspaceSelector /><button type="button">Outside action</button></>)
++    await user.click(screen.getByRole('button', { name: 'Workspace' }))
++    const outside = screen.getByRole('button', { name: 'Outside action' })
++    await user.click(outside)
++    await waitFor(() => expect(screen.queryAllByRole('listbox')).toHaveLength(0))
++    expect(document.activeElement === outside).toBe(true)
++    expect(assign).not.toHaveBeenCalled()
++  })
++  test('updates favorites from another tab without changing workspace identity', async () => {
++    await openPicker()
++    localStorage.setItem(WORKSPACE_FAVORITES_KEY, JSON.stringify(['Research.Team_v2']))
++    fireEvent(window, new StorageEvent('storage', { key: WORKSPACE_FAVORITES_KEY }))
++    expect(screen.getAllByRole('option')[1].textContent).toContain('Ocean notesFavorite')
++    expect(window.__LIGHTRAG_CONFIG__?.workspaceId).toBe('default')
++    expect(assign).not.toHaveBeenCalled()
++  })
 +  test('remains absent on an ordinary deployment without gateway metadata', () => {
 +    window.__LIGHTRAG_CONFIG__ = {}
 +    renderWithProviders(<WorkspaceSelector />)
 +    expect(screen.queryAllByRole('combobox')).toHaveLength(0)
++    expect(screen.queryAllByRole('button', { name: 'Workspace' })).toHaveLength(0)
 +  })
 +})
 +
@@ -1338,16 +1504,18 @@ index 0000000..0927801
 +})
 diff --git a/lightrag_webui/src/components/WorkspaceSelector.tsx b/lightrag_webui/src/components/WorkspaceSelector.tsx
 new file mode 100644
-index 0000000..72598c7
+index 0000000..2c2dc82
 --- /dev/null
 +++ b/lightrag_webui/src/components/WorkspaceSelector.tsx
-@@ -0,0 +1,53 @@
-+import { useId, useState } from 'react'
+@@ -0,0 +1,177 @@
++import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react'
 +import { useTranslation } from 'react-i18next'
-+import { ChevronDown, Search } from 'lucide-react'
++import { Check, ChevronDown, FileText, RefreshCw, Search, Star, X } from 'lucide-react'
 +import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
 +import { workspaceEntryPath } from '@/lib/workspaceRouting'
++import { filterWorkspaces, readFavorites, WORKSPACE_FAVORITES_KEY } from '@/lib/workspaceCatalog'
 +import { useWorkspaceCatalog } from '@/hooks/useWorkspaceCatalog'
++import { Popover, PopoverContent, PopoverTrigger } from './ui/Popover'
 +import WorkspaceCatalog from './WorkspaceCatalog'
 +import WorkspaceState from './WorkspaceState'
 +import Button from './ui/Button'
@@ -1358,6 +1526,29 @@ index 0000000..72598c7
 +  const config = getRuntimeWorkspaceConfig()
 +  const catalog = useWorkspaceCatalog()
 +  const [catalogOpen, setCatalogOpen] = useState(false)
++  const [pickerOpen, setPickerOpen] = useState(false)
++  const [query, setQuery] = useState('')
++  const [favorites, setFavorites] = useState(readFavorites)
++  const [highlightedId, setHighlightedId] = useState<string>()
++  const search = useRef<HTMLInputElement>(null)
++  const rows = filterWorkspaces(catalog.workspaces, query, favorites, false)
++  if (!query.trim()) rows.sort((a, b) => Number(b.id === config?.workspaceId) - Number(a.id === config?.workspaceId))
++  // Resolve by immutable ID, not position: a refresh can reorder or remove rows
++  // while the user is typing. aria-activedescendant must always name a real row.
++  const activeId = rows.some((row) => row.id === highlightedId) ? highlightedId : rows[0]?.id
++  const activeOptionId = activeId ? `${id}-option-${encodeURIComponent(activeId)}` : undefined
++  const current = catalog.workspaces.find((row) => row.id === config?.workspaceId)
++    || config?.workspaces.find((row) => row.id === config.workspaceId)
++  useEffect(() => {
++    const onStorage = (event: StorageEvent) => {
++      if (event.key === WORKSPACE_FAVORITES_KEY || event.key === null) setFavorites(readFavorites())
++    }
++    window.addEventListener('storage', onStorage)
++    return () => window.removeEventListener('storage', onStorage)
++  }, [])
++  useEffect(() => {
++    if (pickerOpen && activeOptionId) document.getElementById(activeOptionId)?.scrollIntoView?.({ block: 'nearest' })
++  }, [pickerOpen, activeOptionId])
 +  if (!config) return null
 +
 +  const changeWorkspace = (workspaceId: string) => {
@@ -1367,29 +1558,128 @@ index 0000000..72598c7
 +    // rather than a shared cookie or localStorage choice, keeps tabs isolated.
 +    window.location.assign(workspaceEntryPath(workspaceId, window.location.pathname))
 +  }
++  const openPicker = (open: boolean) => {
++    setPickerOpen(open)
++    if (open) {
++      setQuery('')
++      setHighlightedId(config.workspaceId)
++      // The catalog can change favorites in this tab; storage events cover
++      // other tabs. Neither path writes selection or retrieval history.
++      setFavorites(readFavorites())
++      void catalog.refresh()
++    }
++  }
++  const choose = (workspaceId: string) => {
++    setPickerOpen(false)
++    changeWorkspace(workspaceId)
++  }
++  const onSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
++    if (event.nativeEvent.isComposing || event.keyCode === 229 || event.altKey || event.ctrlKey || event.metaKey) return
++    const index = rows.findIndex((row) => row.id === activeId)
++    let next: number | undefined
++    if (event.key === 'ArrowDown') next = Math.min(index + 1, rows.length - 1)
++    if (event.key === 'ArrowUp') next = Math.max(index - 1, 0)
++    if (event.key === 'Home') next = 0
++    if (event.key === 'End') next = rows.length - 1
++    if (next !== undefined) {
++      event.preventDefault()
++      setHighlightedId(rows[next]?.id)
++    } else if (event.key === 'Enter') {
++      event.preventDefault()
++      if (activeId) choose(activeId)
++    }
++    // Escape and outside focus/click are handled by Radix, including focus
++    // returning to the trigger without stealing focus from an outside target.
++  }
++  const clearSearch = () => { setQuery(''); setHighlightedId(config.workspaceId); search.current?.focus() }
 +
 +  return (
 +    <div className="flex min-w-0 items-center gap-2">
-+      <label htmlFor={id} className="text-muted-foreground hidden text-xs lg:inline">
-+        {t('workspace.switcher.label', 'Workspace')}
-+      </label>
-+      <div className="relative min-w-0">
-+        <select
-+          id={id}
-+          aria-label={t('workspace.switcher.label', 'Workspace')}
-+          value={config.workspaceId}
-+          onChange={(event) => changeWorkspace(event.target.value)}
-+          className="border-input bg-background text-foreground focus-visible:ring-ring h-8 max-w-[10rem] min-w-24 cursor-pointer appearance-none truncate rounded-md border py-1 pr-7 pl-2 text-xs focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none sm:max-w-[13rem]"
++      <span className="text-muted-foreground hidden text-xs lg:inline">{t('workspace.switcher.label', 'Workspace')}</span>
++      <Popover open={pickerOpen} onOpenChange={openPicker}>
++        <PopoverTrigger asChild>
++          <Button
++            type="button"
++            variant="outline"
++            aria-label={t('workspace.switcher.label', 'Workspace')}
++            aria-describedby={`${id}-current`}
++            className="h-8 max-w-[10rem] min-w-24 justify-between gap-2 px-2 text-xs font-normal sm:max-w-[13rem]"
++            onKeyDown={(event) => {
++              if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); openPicker(true) }
++            }}
++          >
++            <span id={`${id}-current`} className="truncate">{current?.displayName || config.workspaceId}{current ? ` (${current.documents})` : ''}</span>
++            <ChevronDown className="text-muted-foreground" aria-hidden="true" />
++          </Button>
++        </PopoverTrigger>
++        <PopoverContent
++          align="start"
++          sideOffset={6}
++          collisionPadding={12}
++          avoidCollisions
++          aria-label={t('workspace.switcher.choose', 'Choose a workspace')}
++          className="flex max-h-[min(28rem,calc(100dvh-1.5rem),var(--radix-popover-content-available-height))] w-[min(22rem,calc(100vw-1.5rem))] flex-col overflow-hidden p-0"
++          onOpenAutoFocus={(event) => { event.preventDefault(); search.current?.focus() }}
 +        >
-+          {catalog.workspaces.map((workspace) => (
-+            <option key={workspace.id} value={workspace.id}>
-+              {workspace.displayName || workspace.id} ({workspace.documents}){workspace.readOnly ? ` — ${t('workspace.switcher.readOnly', 'read only')}` : ''}
-+            </option>
-+          ))}
-+        </select>
-+        <ChevronDown className="text-muted-foreground pointer-events-none absolute top-2 right-2 size-4" aria-hidden="true" />
-+      </div>
-+      <span className="hidden xl:inline-flex"><WorkspaceState workspace={catalog.workspaces.find((row) => row.id === config.workspaceId)} /></span>
++          <div className="flex shrink-0 items-center gap-1 border-b p-2">
++            <Search className="text-muted-foreground ml-1 size-4 shrink-0" aria-hidden="true" />
++            <input
++              ref={search}
++              role="combobox"
++              aria-label={t('workspace.catalog.search', 'Search workspaces')}
++              aria-expanded={pickerOpen}
++              aria-controls={`${id}-list`}
++              aria-activedescendant={activeOptionId}
++              aria-autocomplete="list"
++              autoComplete="off"
++              spellCheck={false}
++              placeholder={t('workspace.catalog.search', 'Search workspaces')}
++              value={query}
++              onChange={(event) => { setQuery(event.target.value); setHighlightedId(undefined) }}
++              onKeyDown={onSearchKeyDown}
++              className="placeholder:text-muted-foreground focus-visible:ring-ring h-8 min-w-0 flex-1 rounded-sm bg-transparent px-2 text-sm focus-visible:ring-2 focus-visible:outline-none"
++            />
++            {query && <Button type="button" size="icon" variant="ghost" aria-label={t('workspace.switcher.clearSearch', 'Clear search')} onClick={clearSearch}><X aria-hidden="true" /></Button>}
++          </div>
++          <div id={`${id}-list`} role="listbox" aria-label={t('workspace.switcher.label', 'Workspace')} className="min-h-0 overflow-y-auto overscroll-contain p-1">
++            {rows.map((workspace) => {
++              const isCurrent = workspace.id === config.workspaceId
++              const isFavorite = favorites.includes(workspace.id)
++              return <div
++                key={workspace.id}
++                id={`${id}-option-${encodeURIComponent(workspace.id)}`}
++                role="option"
++                aria-selected={workspace.id === activeId}
++                aria-current={isCurrent ? 'true' : undefined}
++                tabIndex={-1}
++                onPointerMove={(event) => { if (event.pointerType !== 'touch') setHighlightedId(workspace.id) }}
++                onMouseDown={(event) => event.preventDefault()}
++                onClick={() => choose(workspace.id)}
++                className="aria-selected:bg-accent aria-selected:text-accent-foreground flex cursor-pointer items-start gap-2 rounded-sm px-2 py-2.5 text-sm select-none"
++              >
++                <span className="mt-0.5 size-4 shrink-0">{isCurrent && <Check className="size-4" aria-hidden="true" />}</span>
++                <div className="min-w-0 flex-1">
++                  <div className="flex min-w-0 items-center gap-1.5">
++                    <span className="truncate font-medium" title={workspace.displayName || workspace.id}>{workspace.displayName || workspace.id}</span>
++                    {isFavorite && <><Star className="size-3 shrink-0 fill-amber-400 text-amber-600 dark:text-amber-400" aria-hidden="true" /><span className="sr-only">{t('workspace.switcher.favorite', 'Favorite')}</span></>}
++                    {isCurrent && <span className="text-muted-foreground shrink-0 text-[11px]">{t('workspace.catalog.current', 'Current')}</span>}
++                  </div>
++                  {workspace.displayName && workspace.displayName !== workspace.id && <p className="text-muted-foreground truncate text-xs" title={workspace.id}>{workspace.id}</p>}
++                  {Boolean(workspace.tags?.length) && <p className="text-muted-foreground truncate text-xs" title={workspace.tags?.join(', ')}>{workspace.tags?.join(' · ')}</p>}
++                  {workspace.readOnly && <span className="text-muted-foreground text-[11px]">{t('workspace.switcher.readOnly', 'read only')}</span>}
++                </div>
++                <span className="text-muted-foreground mt-0.5 flex shrink-0 items-center gap-1 text-xs tabular-nums" aria-label={t('workspace.catalog.documents', { defaultValue: '{{count}} documents', count: workspace.documents })}><FileText className="size-3" aria-hidden="true" />{workspace.documents.toLocaleString()}</span>
++              </div>
++            })}
++          </div>
++          {rows.length === 0 && <p role="status" className="text-muted-foreground px-4 py-6 text-center text-sm">{query.trim() ? t('workspace.catalog.noResults', 'No workspaces match your search.') : t('workspace.switcher.empty', 'No workspaces are available.')}</p>}
++          <div className="flex shrink-0 items-center justify-between gap-2 border-t px-3 py-2">
++            <p role="status" className="text-muted-foreground text-xs">{catalog.refreshing ? t('workspace.switcher.refreshing', 'Refreshing workspaces…') : catalog.stale ? t('workspace.catalog.stale', 'Showing the last available list. Refresh to check for changes.') : ''}</p>
++            <Button type="button" size="icon" variant="ghost" aria-label={t('workspace.catalog.refresh', 'Refresh workspaces')} disabled={catalog.refreshing} onClick={() => { void catalog.refresh() }}><RefreshCw aria-hidden="true" /></Button>
++          </div>
++        </PopoverContent>
++      </Popover>
++      <span className="hidden xl:inline-flex"><WorkspaceState workspace={current} /></span>
 +      <Button size="icon" variant="ghost" tooltip={t('workspace.catalog.title', 'Your workspaces')} aria-label={t('workspace.catalog.title', 'Your workspaces')} onClick={() => setCatalogOpen(true)}><Search /></Button>
 +      <WorkspaceCatalog open={catalogOpen} onOpenChange={setCatalogOpen} {...catalog} currentId={config.workspaceId} select={changeWorkspace} />
 +    </div>
@@ -1528,7 +1818,7 @@ index c501083..1f7396f 100644
    // The tick is stored WITH the document it was given for; a language switch
    // replaces that document, and consent must not survive the swap.
 @@ -154,6 +157,7 @@ const LoginPage = ({ autoActivateGuest = true }: LoginPageProps) => {
- 
+
        } catch (error) {
          console.error('Failed to check auth configuration:', error)
 +        if (isWorkspaceBootstrapError(error)) setWorkspaceError(error)
@@ -1544,7 +1834,7 @@ index c501083..1f7396f 100644
 +  if (workspaceError || checkingAuth || content.loading) {
 +    return <WorkspaceOpening error={workspaceError} />
    }
- 
+
    const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
 diff --git a/lightrag_webui/src/features/SiteHeader.tsx b/lightrag_webui/src/features/SiteHeader.tsx
 index dfb200a..8bff578 100644
@@ -1556,12 +1846,12 @@ index dfb200a..8bff578 100644
  import TouchDescriptionPopover from '@/components/ui/TouchDescriptionPopover'
 +import WorkspaceSelector from '@/components/WorkspaceSelector'
 +import WorkspaceReadOnlyNotice from '@/components/WorkspaceReadOnlyNotice'
- 
+
  interface NavigationTabProps {
    value: string
 @@ -80,87 +82,93 @@ export default function SiteHeader() {
    }
- 
+
    return (
 -    <header className="border-border/40 bg-background/95 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50 flex h-10 w-full border-b px-4 backdrop-blur">
 -      <div className="min-w-[200px] w-auto flex items-center">
@@ -1728,7 +2018,7 @@ index dfb200a..8bff578 100644
    )
  }
 diff --git a/lightrag_webui/src/features/loginLogo.test.tsx b/lightrag_webui/src/features/loginLogo.test.tsx
-index 40bcf5f..dfb8826 100644
+index 40bcf5f..3cc0e29 100644
 --- a/lightrag_webui/src/features/loginLogo.test.tsx
 +++ b/lightrag_webui/src/features/loginLogo.test.tsx
 @@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom'
@@ -1736,16 +2026,16 @@ index 40bcf5f..dfb8826 100644
  import { useAuthStore } from '@/stores/state'
  import { resetCustomization, seedCustomization } from '@/test/customization'
 +import { WorkspaceBootstrapError } from '@/api/errors'
- 
+
  const BUNDLE_LOGO = 'https://cdn.example.test/acme-logo.png'
- 
+
 @@ -20,6 +21,8 @@ const BUNDLE_LOGO = 'https://cdn.example.test/acme-logo.png'
   */
  let realApiModule: Record<string, unknown>
  let LoginPage: typeof import('./LoginPage').default
 +let authFailure: WorkspaceBootstrapError | null = null
 +const originalRuntimeConfig = window.__LIGHTRAG_CONFIG__
- 
+
  /**
   * What `/auth-status` reports for the next render. Read INSIDE the mock so a
 @@ -35,7 +38,10 @@ beforeAll(async () => {
@@ -1761,7 +2051,7 @@ index 40bcf5f..dfb8826 100644
    LoginPage = (await import('./LoginPage')).default
  })
 @@ -46,6 +52,7 @@ afterAll(() => {
- 
+
  beforeEach(() => {
    authStatus = { auth_configured: true }
 +  authFailure = null
@@ -1775,11 +2065,11 @@ index 40bcf5f..dfb8826 100644
 +  window.__LIGHTRAG_CONFIG__ = originalRuntimeConfig
    resetCustomization()
  })
- 
+
 @@ -89,6 +97,24 @@ const renderLogin = async () => {
    return view
  }
- 
+
 +describe('gateway login bootstrap failure', () => {
 +  for (const [reason, status] of [['unavailable', 409], ['unavailable', 503], ['timeout', undefined], ['network', undefined]] as const) {
 +    test(`${reason} ${status ?? ''} keeps the workspace error and selector instead of a login form`, async () => {
@@ -1791,7 +2081,7 @@ index 40bcf5f..dfb8826 100644
 +      authFailure = new WorkspaceBootstrapError(reason, status)
 +      await renderLogin()
 +      expect(await screen.findByRole('alert')).toHaveTextContent('Could not open workspace research')
-+      expect(screen.getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
++      expect(screen.getByRole('button', { name: 'Workspace' })).toBeInTheDocument()
 +      expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
 +      expect(screen.queryAllByRole('textbox')).toHaveLength(0)
 +    })
@@ -1813,7 +2103,7 @@ index 7611949..fa4b29d 100644
 +import WorkspaceReadOnlyNotice from '@/components/WorkspaceReadOnlyNotice'
 +import { WorkspaceOpeningStatus } from '@/components/WorkspaceOpening'
 +import { isWorkspaceBootstrapError, type WorkspaceBootstrapError } from '@/api/errors'
- 
+
  /**
   * The workspace entry's app shell: a slim header (brand, deployment title,
 @@ -38,6 +42,7 @@ export default function WorkspaceApp() {
@@ -1841,7 +2131,7 @@ index 7611949..fa4b29d 100644
      runCredentialProbe()
 -  }, [initializing])
 +  }, [initializing, workspaceError])
- 
+
    // Requests come from the startup probe AND from a query rejected on
    // credential grounds (the server key can be rotated long after startup).
 @@ -125,7 +131,7 @@ export default function WorkspaceApp() {
@@ -1866,7 +2156,7 @@ index 7611949..fa4b29d 100644
          </nav>
        </header>
 +      <WorkspaceReadOnlyNotice />
- 
+
        <div className="relative min-h-0 grow">
 -        {initializing ? (
 +        {initializing || workspaceError ? (
@@ -1881,7 +2171,7 @@ index 7611949..fa4b29d 100644
          ) : (
            <ErrorBoundary>
 diff --git a/lightrag_webui/src/features/workspace/WorkspaceWelcome.test.tsx b/lightrag_webui/src/features/workspace/WorkspaceWelcome.test.tsx
-index 09a313a..ea8dbb4 100644
+index 09a313a..cba5b88 100644
 --- a/lightrag_webui/src/features/workspace/WorkspaceWelcome.test.tsx
 +++ b/lightrag_webui/src/features/workspace/WorkspaceWelcome.test.tsx
 @@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router-dom'
@@ -1889,16 +2179,16 @@ index 09a313a..ea8dbb4 100644
  import { useAuthStore } from '@/stores/state'
  import { resetCustomization, seedCustomization } from '@/test/customization'
 +import { WorkspaceBootstrapError } from '@/api/errors'
- 
+
  const DESCRIPTION = 'Internal deployment — do not share externally'
- 
+
 @@ -17,12 +18,17 @@ const DESCRIPTION = 'Internal deployment — do not share externally'
   */
  let realApiModule: Record<string, unknown>
  let WorkspaceWelcome: typeof import('./WorkspaceWelcome').default
 +let authFailure: WorkspaceBootstrapError | null = null
 +const originalRuntimeConfig = window.__LIGHTRAG_CONFIG__
- 
+
  beforeAll(async () => {
    realApiModule = { ...(await import('@/api/lightrag')) }
    mock.module('@/api/lightrag', () => ({
@@ -1913,7 +2203,7 @@ index 09a313a..ea8dbb4 100644
  })
 @@ -32,6 +38,7 @@ afterAll(() => {
  })
- 
+
  beforeEach(() => {
 +  authFailure = null
    // The welcome page is for visitors who are NOT signed in; an earlier test
@@ -1926,10 +2216,10 @@ index 09a313a..ea8dbb4 100644
 +  window.__LIGHTRAG_CONFIG__ = originalRuntimeConfig
    resetCustomization()
  })
- 
+
 @@ -71,6 +79,20 @@ const renderWelcome = async () => {
  }
- 
+
  describe('workspace welcome branding', () => {
 +  test('a failed gateway opening offers retry and workspace selection instead of sign in', async () => {
 +    window.__LIGHTRAG_CONFIG__ = {
@@ -1940,7 +2230,7 @@ index 09a313a..ea8dbb4 100644
 +    seedCustomization({}, { customized: false })
 +    await renderWelcome()
 +    expect(await screen.findByRole('alert')).toHaveTextContent('Could not open workspace research')
-+    expect(screen.getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
++    expect(screen.getByRole('button', { name: 'Workspace' })).toBeInTheDocument()
 +    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
 +    expect(screen.queryAllByRole('button', { name: 'Sign in' })).toHaveLength(0)
 +  })
@@ -1960,7 +2250,7 @@ index 96b9494..ae977e0 100644
 +import WorkspaceOpening, { WorkspaceOpeningStatus } from '@/components/WorkspaceOpening'
 +import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
 +import { isWorkspaceBootstrapError, type WorkspaceBootstrapError } from '@/api/errors'
- 
+
  /**
   * The workspace entry's public welcome page — the unauthenticated default of
 @@ -31,6 +35,7 @@ export default function WorkspaceWelcome() {
@@ -1981,7 +2271,7 @@ index 96b9494..ae977e0 100644
 +        else setAuthConfigured(true)
 +      })
    }, [isAuthenticated])
- 
+
    const handlePrimaryAction = useCallback(async () => {
 @@ -88,7 +96,8 @@ export default function WorkspaceWelcome() {
        }
@@ -1998,7 +2288,7 @@ index 96b9494..ae977e0 100644
      return <Navigate to="/" replace />
    }
 +  if (workspaceError) return <WorkspaceOpening error={workspaceError} />
- 
+
    return (
      <div
 @@ -116,6 +126,7 @@ export default function WorkspaceWelcome() {
@@ -2031,7 +2321,7 @@ index 5828bc9..7d0646d 100644
 @@ -49,7 +49,7 @@ describe('BFCache consumers', () => {
        expect(source).not.toContain('addEventListener(\'beforeunload\'')
      }
- 
+
 -    expect(appSource).toContain('[enableHealthCheck, apiKeyAlertOpen, pageRestoreGeneration]')
 +    expect(appSource).toContain('[enableHealthCheck, apiKeyAlertOpen, pageRestoreGeneration, gatewayWorkspaceId, initializing, workspaceError]')
      expect(documentManagerSource).toContain(
@@ -2166,7 +2456,7 @@ index 2668b1d..b3ed9f6 100644
 @@ -17,10 +17,33 @@
   * `constants.ts`); this module returns the raw injected value.
   */
- 
+
 +export interface RuntimeWorkspace {
 +  id: string
 +  documents: number
@@ -2200,7 +2490,7 @@ index 2668b1d..b3ed9f6 100644
 @@ -50,6 +73,24 @@ export function getRuntimeApiPrefix(): string | undefined {
    return config.apiPrefix
  }
- 
+
 +/** Gateway metadata is immutable during a page visit; switching reloads the entry. */
 +export function getRuntimeWorkspaceConfig() {
 +  if (typeof window === 'undefined') return undefined
@@ -2245,7 +2535,7 @@ index ad739f9..a178ec6 100644
 @@ -15,12 +14,19 @@
   * it first may write ALL of these keys.
   */
- 
+
 -export const STORAGE_NS = ''
 +import { getRuntimeWorkspaceConfig } from './runtimeConfig'
 +import { createWorkspaceStorageKeys } from './workspaceRouting'
@@ -2254,16 +2544,16 @@ index ad739f9..a178ec6 100644
 +const keys = createWorkspaceStorageKeys(workspace?.workspaceId, workspace?.legacyStorageWorkspace)
 +
 +export const STORAGE_NS = keys.namespace
- 
+
  export const storageKey = (name: string): string => `lightrag:${STORAGE_NS}:${name}`
- 
+
 -export const QUERY_SETTINGS_STORAGE_KEY = storageKey('query-settings-storage')
 -export const WEBUI_RETRIEVAL_HISTORY_KEY = storageKey('webui-retrieval-history')
 -export const WORKSPACE_RETRIEVAL_HISTORY_KEY = storageKey('workspace-retrieval-history')
 +export const QUERY_SETTINGS_STORAGE_KEY = keys.querySettings
 +export const WEBUI_RETRIEVAL_HISTORY_KEY = keys.webuiHistory
 +export const WORKSPACE_RETRIEVAL_HISTORY_KEY = keys.workspaceHistory
- 
+
 -export const LEGACY_SETTINGS_STORAGE_KEY = 'settings-storage'
 +export const LEGACY_SETTINGS_STORAGE_KEY = keys.settings
 +export const SEARCH_HISTORY_STORAGE_KEY = keys.searchHistory
@@ -2438,14 +2728,19 @@ index 0000000..e403303
 +  }
 +}
 diff --git a/lightrag_webui/src/locales/en.json b/lightrag_webui/src/locales/en.json
-index ff04a3c..da29ce5 100644
+index ff04a3c..34b8db0 100644
 --- a/lightrag_webui/src/locales/en.json
 +++ b/lightrag_webui/src/locales/en.json
-@@ -519,6 +519,22 @@
+@@ -519,6 +519,27 @@
      "lastPage": "Last Page"
    },
    "workspace": {
 +    "switcher": {
++      "choose": "Choose a workspace",
++      "clearSearch": "Clear search",
++      "favorite": "Favorite",
++      "refreshing": "Refreshing workspaces…",
++      "empty": "No workspaces are available.",
 +      "label": "Workspace",
 +      "opening": "Opening workspace {{workspace}}…",
 +      "openingFailed": "Could not open workspace {{workspace}}",
@@ -2464,7 +2759,7 @@ index ff04a3c..da29ce5 100644
      "welcome": {
        "defaultMarkdown": "Welcome! Ask questions about the knowledge base and get answers with citations. Sign in to get started.",
        "enterButton": "Enter workspace",
-@@ -527,6 +543,82 @@
+@@ -527,6 +548,82 @@
      },
      "queryEmpty": {
        "defaultMarkdown": "Ask anything about the knowledge base to get started."
@@ -2548,14 +2843,19 @@ index ff04a3c..da29ce5 100644
    },
    "migration": {
 diff --git a/lightrag_webui/src/locales/ru.json b/lightrag_webui/src/locales/ru.json
-index 09aa260..684a02d 100644
+index 09aa260..1a61d27 100644
 --- a/lightrag_webui/src/locales/ru.json
 +++ b/lightrag_webui/src/locales/ru.json
-@@ -519,6 +519,22 @@
+@@ -519,6 +519,27 @@
      "lastPage": "Последняя страница"
    },
    "workspace": {
 +    "switcher": {
++      "choose": "Выберите workspace",
++      "clearSearch": "Очистить поиск",
++      "favorite": "В избранном",
++      "refreshing": "Обновление списка…",
++      "empty": "Нет доступных workspace.",
 +      "label": "Рабочее пространство",
 +      "opening": "Открываем пространство {{workspace}}…",
 +      "openingFailed": "Не удалось открыть пространство {{workspace}}",
@@ -2574,7 +2874,7 @@ index 09aa260..684a02d 100644
      "welcome": {
        "defaultMarkdown": "Добро пожаловать! Задавайте вопросы по базе знаний и получайте ответы с цитатами. Войдите, чтобы начать.",
        "enterButton": "Войти в рабочее пространство",
-@@ -527,6 +543,82 @@
+@@ -527,6 +548,82 @@
      },
      "queryEmpty": {
        "defaultMarkdown": "Задайте любой вопрос по базе знаний, чтобы начать."
@@ -2664,7 +2964,7 @@ index 019b0b4..79bbf2b 100644
 @@ -136,8 +136,8 @@ describe('navigation core stays graph-free', () => {
    })
  })
- 
+
 -describe('no path-rewriting hard navigation in the SPA', () => {
 -  test('frontend source contains no location.href= / location.replace( / location.assign(', () => {
 +describe('hard navigation is limited to deliberate workspace switching', () => {
@@ -2694,15 +2994,15 @@ index 0af592a..d914e23 100644
 @@ -1,4 +1,5 @@
  import { searchHistoryMaxItems, searchHistoryVersion } from '@/lib/constants'
 +import { SEARCH_HISTORY_STORAGE_KEY } from '@/lib/storageKeys'
- 
+
  /**
   * SearchHistoryManager - Manages search history persistence in localStorage
 @@ -23,7 +24,7 @@ export interface SearchHistoryData {
  }
- 
+
  export class SearchHistoryManager {
 -  private static readonly STORAGE_KEY = 'lightrag_search_history'
 +  private static readonly STORAGE_KEY = SEARCH_HISTORY_STORAGE_KEY
    private static readonly MAX_HISTORY = searchHistoryMaxItems
    private static readonly VERSION = searchHistoryVersion
- 
+
