@@ -41,6 +41,23 @@ class PostgresInventory:
             except Exception:
                 pool.terminate()
 
+    async def probe(self, expected_database: str) -> bool:
+        """Read database identity and registry presence without waking a worker."""
+        try:
+            pool = await self._pool()
+            async with pool.acquire(timeout=5) as connection:
+                async with connection.transaction(readonly=True):
+                    await connection.execute("SET LOCAL statement_timeout = '3s'")
+                    marker = await connection.fetchrow(
+                        "SELECT current_database() AS database, db_instance_id::text AS db_instance_id, schema_version "
+                        "FROM lightrag_workspace_database WHERE singleton = TRUE")
+                    registry = await connection.fetchval("SELECT to_regclass('public.lightrag_workspace_registry') IS NOT NULL")
+                    return bool(marker and marker["database"] == expected_database and marker["schema_version"] == 1 and registry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
+
     async def refresh(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         registered = [item for item in items if item.get("available") and item.get("_postgresManifest")]
         if not registered:
@@ -83,7 +100,7 @@ class PostgresInventory:
                         or row["db_instance_id"] != manifest["db_instance_id"]
                         or row["embedding_model"] != manifest["embedding_model"]
                         or row["embedding_dim"] != manifest["embedding_dim"]):
-                    item.update(available=False, readOnly=True, readOnlyReason=(
+                    item.update(available=False, readOnly=True, errorCode="workspace_registration_invalid", readOnlyReason=(
                         "PostgreSQL workspace registration does not match the verified database."
                     ))
                     continue
@@ -106,7 +123,7 @@ class PostgresInventory:
             # only a generic state; no credentials or document data are needed.
             logging.getLogger(__name__).warning("PostgreSQL workspace discovery is unavailable")
             for item in registered:
-                item.update(available=False, readOnly=True, readOnlyReason=(
+                item.update(available=False, readOnly=True, errorCode="database_unavailable", readOnlyReason=(
                     "PostgreSQL workspace status is unavailable; retry after the database is reachable."
                 ))
         finally:

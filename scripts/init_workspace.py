@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicitly create an empty corpus directory; API requests never create one."""
+"""Explicitly create an empty corpus directory; routed query requests never create one."""
 from __future__ import annotations
 
 import argparse

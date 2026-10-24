@@ -14,12 +14,15 @@ A community extension for [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG) th
 
 ## What you get
 
-- **A workspace selector** in the admin and retrieval interfaces, with separate browser conversations and settings for each workspace.
+- **A searchable workspace catalog** in both interfaces, with display names, tags, favorites, lifecycle states and separate browser conversations/settings.
+- **Explicit creation through UI and API**, with durable idempotent operations and immutable workspace IDs.
 - **Two explicit API selectors:** `/workspaces/<id>/…` or the `LIGHTRAG-WORKSPACE` request header.
 - **Workers loaded on demand**, a bounded active pool, idle eviction, and protection for active requests and streams.
 - **Existing directory names preserved**, with startup compatibility writes disabled and unfinished legacy imports held for inspection.
 - **Lower transient vector-loading memory** through a bounded loader for the pinned NanoVectorDB format. Memory admission remains an estimate; set a container limit.
 - **PostgreSQL + VCHORDRQ storage**, including a verified importer for existing JSON, NanoVectorDB, and GraphML data. Exact workspace names and both API selectors stay the same.
+
+- **Operations and quality gates:** consistent backups, isolated restore drills, retained-image rollback, version-preserving imports and checks of cited source facts. See [operations](docs/guides/operations.md) and [quality](docs/guides/quality.md).
 
 ## Quick start
 
@@ -39,13 +42,13 @@ docker compose run --rm --no-deps --entrypoint python lightrag /opt/lightrag-mul
 docker compose up -d
 ```
 
-Open **[localhost:9621/webui/](http://localhost:9621/webui/)**. Add another empty workspace with the same initializer:
+Open **[localhost:9621/webui/](http://localhost:9621/webui/)**. Use **New workspace** in the catalog for subsequent corpora, or use the offline file-mode initializer:
 
 ```sh
 docker compose run --rm --no-deps --entrypoint python lightrag /opt/lightrag-multiworkspace/scripts/init_workspace.py research
 ```
 
-Refresh the page to see it in the selector. Unknown API workspace names return `404`; they never create a corpus.
+The catalog refreshes its list automatically. Queries to unknown workspace names return `404`; only an explicit creation operation creates a corpus.
 
 ```sh
 curl http://localhost:9621/workspaces

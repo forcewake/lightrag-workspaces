@@ -12,7 +12,7 @@ Worker logs are stored under the mounted runtime tree. They can contain document
 
 ## The workspace is missing
 
-Check that its directory is a direct child of the configured storage root, uses a supported exact identifier, and is not a symlink. Refresh an already-open page. If the workspace is meant to be new, run the explicit initializer. Unknown API identifiers never create directories.
+Check that its directory is a direct child of the configured storage root, uses a supported exact identifier, and is not a symlink. Refresh an already-open page. If the workspace is meant to be new, use the catalog creation form or explicit creation API. The file-mode initializer remains available for initial bootstrap. Querying an unknown ID never creates directories.
 
 If existing files sit directly in the storage root, review the [adoption layout](../guides/existing-data.md); discovery expects named child directories.
 

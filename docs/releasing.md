@@ -25,6 +25,6 @@ Release from a reviewed commit with an exact upstream source pin and runtime ima
 
 Write a changelog around changed behavior and practical compatibility limits. Distinguish unit checks, synthetic integration, browser checks, and workload-specific validation. Do not reuse an old runtime verification as proof for a changed image.
 
-Tag the reviewed extension revision. If distributing container images, record immutable digests and supported architectures, preserve source/notice links, and test the published artifact independently. The source-build path must remain documented even if a registry package is provided later.
+Tag the reviewed extension revision. The Versioned image workflow runs on an existing `vMAJOR.MINOR.PATCH` tag, requires it to match `pyproject.toml`, and builds/tests linux/amd64 before pushing version and full-SHA tags to GHCR. It then pulls the immutable registry digest and repeats artifact checks. Record that digest and architecture in the release; retain source/notice links. Source builds remain supported. Never move an existing release tag to hide a failed or changed artifact.
 
 Keep the previous image and a verified cold backup for each deployment upgrade. Release publication and deployment are separate actions; a published tag does not mean an existing host has been upgraded.

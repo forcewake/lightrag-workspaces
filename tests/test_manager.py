@@ -152,7 +152,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 async with self.manager.lease("research"):
                     self.fail("Admitted over available memory")
         self.assertEqual(caught.exception.status_code, 503)
-        self.assertIn("memory", caught.exception.detail)
+        self.assertEqual(caught.exception.detail["code"], "workspace_memory_unavailable")
         self.assertEqual(busy.process.signals, [])
         self.manager._spawn.assert_not_awaited()
 

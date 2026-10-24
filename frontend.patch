@@ -64,10 +64,10 @@ index 7068c52..dda1247 100644
            <div className="flex h-screen w-screen flex-col">
              {/* Simplified header during initialization - matches SiteHeader structure */}
 diff --git a/lightrag_webui/src/api/errors.ts b/lightrag_webui/src/api/errors.ts
-index d88c7d7..67dcc14 100644
+index d88c7d7..2733b26 100644
 --- a/lightrag_webui/src/api/errors.ts
 +++ b/lightrag_webui/src/api/errors.ts
-@@ -25,3 +25,19 @@ export function isAuthenticationRequiredError(
+@@ -25,3 +25,22 @@ export function isAuthenticationRequiredError(
      (error instanceof Error && error.name === 'AuthenticationRequiredError')
    )
  }
@@ -76,7 +76,10 @@ index d88c7d7..67dcc14 100644
 +export class WorkspaceBootstrapError extends Error {
 +  constructor(
 +    public readonly reason: 'unavailable' | 'timeout' | 'network' | 'invalid_response',
-+    public readonly status?: number
++    public readonly status?: number,
++    public readonly code?: string,
++    public readonly retryable?: boolean,
++    public readonly retryAfterSeconds?: number
 +  ) {
 +    super('Workspace could not be opened')
 +    this.name = 'WorkspaceBootstrapError'
@@ -88,7 +91,7 @@ index d88c7d7..67dcc14 100644
 +    (error instanceof Error && error.name === 'WorkspaceBootstrapError')
 +}
 diff --git a/lightrag_webui/src/api/lightrag-stream.test.ts b/lightrag_webui/src/api/lightrag-stream.test.ts
-index e7f67f3..240622c 100644
+index e7f67f3..ccf6c07 100644
 --- a/lightrag_webui/src/api/lightrag-stream.test.ts
 +++ b/lightrag_webui/src/api/lightrag-stream.test.ts
 @@ -1,4 +1,5 @@
@@ -148,13 +151,22 @@ index e7f67f3..240622c 100644
  // ---------------------------------------------------------------------------
  // Helpers
  // ---------------------------------------------------------------------------
-@@ -149,14 +119,23 @@ let authStore: typeof import('@/stores/state').useAuthStore
+@@ -136,6 +106,7 @@ function installFetchMock(
+ // Tests
+ // ---------------------------------------------------------------------------
+
++let originalFetch: typeof globalThis.fetch
+ let apiModule: typeof import('./lightrag')
+ let settingsStore: typeof import('@/stores/settings').useSettingsStore
+ let authStore: typeof import('@/stores/state').useAuthStore
+@@ -149,14 +120,24 @@ let authStore: typeof import('@/stores/state').useAuthStore
  let restoreMocks: (() => void) | undefined
  
  beforeAll(async () => {
 -  // Dynamic imports AFTER the axios/constants mocks above, so the api module's
 -  // axios instance is the mocked one. These are the REAL store and navigation
 -  // modules — see the isolation note at the top of this file.
++  originalFetch = globalThis.fetch
 +  // Use the real axios instance and interceptors regardless of test-file order.
 +  // Only the standalone guest-token request is stubbed and restored below.
    settingsStore = (await import('@/stores/settings')).useSettingsStore
@@ -175,7 +187,7 @@ index e7f67f3..240622c 100644
    // Restorable, not module-level: the 401 paths under test call this; a
    // module mock would leak a no-op service into every later test file.
    const navSpy = spyOn(navigationService, 'navigateToUnauthenticated')
-@@ -164,6 +143,7 @@ beforeAll(async () => {
+@@ -164,6 +145,7 @@ beforeAll(async () => {
    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
    restoreMocks = () => {
@@ -183,6 +195,20 @@ index e7f67f3..240622c 100644
      navSpy.mockRestore()
      errorSpy.mockRestore()
      warnSpy.mockRestore()
+@@ -171,10 +153,13 @@ beforeAll(async () => {
+ })
+
+ afterAll(() => {
++  globalThis.fetch = originalFetch
+   restoreMocks?.()
+ })
+
+ afterEach(() => {
++  // A mock left on global fetch contaminates later spies and their call counts.
++  globalThis.fetch = originalFetch
+   storageData.clear()
+   // Reset the REAL stores' state this file drives (the guest-retry tests go
+   // through the real login(), which flips isAuthenticated/username too).
 diff --git a/lightrag_webui/src/api/lightrag.test.ts b/lightrag_webui/src/api/lightrag.test.ts
 index 890fcbd..1fb6fe3 100644
 --- a/lightrag_webui/src/api/lightrag.test.ts
@@ -294,7 +320,7 @@ index 890fcbd..1fb6fe3 100644
 +  })
 +})
 diff --git a/lightrag_webui/src/api/lightrag.ts b/lightrag_webui/src/api/lightrag.ts
-index 27982d8..4ec7c65 100644
+index 27982d8..88fd19d 100644
 --- a/lightrag_webui/src/api/lightrag.ts
 +++ b/lightrag_webui/src/api/lightrag.ts
 @@ -14,7 +14,8 @@ import { useSettingsStore } from '@/stores/settings'
@@ -307,7 +333,29 @@ index 27982d8..4ec7c65 100644
  
  // Types
  export type LightragNodeType = {
-@@ -1062,9 +1063,10 @@ export const deleteDocuments = async (
+@@ -473,7 +474,7 @@ axiosInstance.interceptors.request.use((config) => {
+  * error that must not trip its circuit breaker), and a plain Error left them
+  * unable to tell a 404 from a network failure.
+  */
+-export type HttpRequestError = Error & { status?: number }
++export type HttpRequestError = Error & { status?: number; code?: string; retryable?: boolean; retryAfterSeconds?: number }
+
+ export const toHttpRequestError = (
+   status: number,
+@@ -485,6 +486,12 @@ export const toHttpRequestError = (
+     `${status} ${statusText}\n${JSON.stringify(data)}\n${url}`
+   ) as HttpRequestError
+   error.status = status
++  if (data && typeof data === 'object') {
++    const value = data as Record<string, unknown>
++    if (typeof value.code === 'string') error.code = value.code
++    if (typeof value.retryable === 'boolean') error.retryable = value.retryable
++    if (typeof value.retryAfterSeconds === 'number') error.retryAfterSeconds = value.retryAfterSeconds
++  }
+   return error
+ }
+
+@@ -1062,9 +1069,10 @@ export const deleteDocuments = async (
  
  export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
    try {
@@ -320,7 +368,7 @@ index 27982d8..4ec7c65 100644
        headers: {
          'Accept': 'application/json' // Explicitly request JSON
        }
-@@ -1075,6 +1077,7 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
+@@ -1075,6 +1083,7 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
      const contentType = typeof contentTypeHeader === 'string' ? contentTypeHeader : '';
      if (contentType.includes('text/html')) {
        console.warn('Received HTML response instead of JSON for auth-status endpoint');
@@ -328,7 +376,7 @@ index 27982d8..4ec7c65 100644
        return {
          auth_configured: true,
          auth_mode: 'enabled'
-@@ -1109,14 +1112,28 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
+@@ -1109,14 +1118,28 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
      // If response data is invalid but we got a response, log it
      console.warn('Received invalid auth status response:', response.data);
  
@@ -344,26 +392,666 @@ index 27982d8..4ec7c65 100644
      console.error('Failed to get auth status:', errorMessage(error));
 +    if (getRuntimeWorkspaceConfig()) {
 +      if (isWorkspaceBootstrapError(error)) throw error
-+      const failure = error as { status?: number; code?: string; message?: string }
++      const failure = error as HttpRequestError
 +      // Authentication failures retain the existing sign-in/API-key path.
 +      // Availability failures must never manufacture a credential prompt.
 +      if (!isAuthenticationRequiredError(error) && failure.status !== 401 && failure.status !== 403) {
 +        const reason = failure.code === 'ECONNABORTED' || failure.code === 'ETIMEDOUT' || /timeout/i.test(failure.message || '')
 +          ? 'timeout'
 +          : failure.status ? 'unavailable' : 'network'
-+        throw new WorkspaceBootstrapError(reason, failure.status)
++        throw new WorkspaceBootstrapError(reason, failure.status, failure.code, failure.retryable, failure.retryAfterSeconds)
 +      }
 +    }
 +    // Preserve the stock deployment fallback and real authentication failures.
      return {
        auth_configured: true,
        auth_mode: 'enabled'
+diff --git a/lightrag_webui/src/api/workspaces.test.ts b/lightrag_webui/src/api/workspaces.test.ts
+new file mode 100644
+index 0000000..182e6f9
+--- /dev/null
++++ b/lightrag_webui/src/api/workspaces.test.ts
+@@ -0,0 +1,66 @@
++import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
++import { createWorkspace, getWorkspaceCatalog, getWorkspaceOperation, WorkspaceManagementError } from './workspaces'
++import { cleanup } from '@testing-library/react'
++import { useSettingsStore } from '@/stores/settings'
++
++let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, 'fetch'>> | undefined
++const originalKey = useSettingsStore.getState().apiKey
++const originalToken = localStorage.getItem('LIGHTRAG-API-TOKEN')
++const originalConfig = window.__LIGHTRAG_CONFIG__
++// Other files mount shared headers; unmount before installing a process-wide fetch spy.
++beforeEach(() => { cleanup() })
++afterEach(() => {
++  cleanup()
++  fetchSpy?.mockRestore(); fetchSpy = undefined
++  useSettingsStore.setState({ apiKey: originalKey })
++  if (originalToken === null) localStorage.removeItem('LIGHTRAG-API-TOKEN'); else localStorage.setItem('LIGHTRAG-API-TOKEN', originalToken)
++  window.__LIGHTRAG_CONFIG__ = originalConfig
++})
++function response(body: unknown, status = 200) { return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }) }
++const body = { id: 'Notes_2026.v1', displayName: 'Notes', description: '', tags: [] }
++describe('gateway workspace API', () => {
++  test('discovery stays at gateway root with credentials and never wakes a scoped worker', async () => {
++    window.__LIGHTRAG_CONFIG__ = { apiPrefix: '/workspaces/research' }
++    useSettingsStore.setState({ apiKey: 'test-key' })
++    localStorage.setItem('LIGHTRAG-API-TOKEN', 'test-session-token')
++    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (url: RequestInfo | URL, init?: RequestInit) => {
++      expect(url).toBe('/workspaces')
++      expect(init?.method).toBe('GET')
++      expect(init?.cache).toBe('no-store')
++      expect(init?.credentials).toBe('same-origin')
++      expect(init?.headers).toMatchObject({ 'X-API-Key': 'test-key', Authorization: 'Bearer test-session-token' })
++      expect(init?.body).toBeUndefined()
++      return response({ workspaces: [], capabilities: {} })
++    }) as typeof fetch)
++    await getWorkspaceCatalog()
++    expect(fetchSpy).toHaveBeenCalledTimes(1)
++  })
++  test('create sends exactly one mutation with the original idempotency key and exact ID', async () => {
++    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (url: RequestInfo | URL, init?: RequestInit) => {
++      expect(url).toBe('/workspaces')
++      expect(init?.method).toBe('POST')
++      expect(init?.headers).toMatchObject({ 'Idempotency-Key': 'test-key-1234567890' })
++      expect(JSON.parse(String(init?.body))).toEqual(body)
++      return response({ id: 'op-1', workspaceId: body.id, state: 'pending' }, 202)
++    }) as typeof fetch)
++    expect(await createWorkspace(body, 'test-key-1234567890')).toMatchObject({ state: 'pending', workspaceId: body.id })
++    expect(fetchSpy).toHaveBeenCalledTimes(1)
++  })
++  test('network failure is uncertain and never automatically repeats a creation', async () => {
++    fetchSpy = spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('offline'))
++    try { await createWorkspace(body, 'test-key-1234567890'); throw new Error('expected failure') }
++    catch (error) {
++      expect(error).toBeInstanceOf(WorkspaceManagementError)
++      expect(error).toMatchObject({ uncertain: true, retryable: true, code: 'connection' })
++    }
++    expect(fetchSpy).toHaveBeenCalledTimes(1)
++  })
++  test('safe operation error classification does not expose a response body', async () => {
++    fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(response({ detail: { code: 'maintenance_active', retryable: true, message: 'private internals' } }, 503))
++    await expect(getWorkspaceOperation('op-1', body.id)).rejects.toMatchObject({ code: 'maintenance_active', retryable: true, message: 'maintenance_active', uncertain: false })
++  })
++  test('an operation for a different workspace cannot complete this request', async () => {
++    fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(response({ id: 'op-1', workspaceId: 'different', state: 'succeeded' }))
++    await expect(getWorkspaceOperation('op-1', body.id)).rejects.toMatchObject({ code: 'invalid_response' })
++  })
++})
+diff --git a/lightrag_webui/src/api/workspaces.ts b/lightrag_webui/src/api/workspaces.ts
+new file mode 100644
+index 0000000..d779b3e
+--- /dev/null
++++ b/lightrag_webui/src/api/workspaces.ts
+@@ -0,0 +1,93 @@
++import type { RuntimeWorkspace } from '@/lib/runtimeConfig'
++import { useSettingsStore } from '@/stores/settings'
++
++export interface WorkspaceCapabilities {
++  management?: boolean
++  metadata?: boolean
++  create?: boolean
++  prewarm?: boolean
++}
++export interface WorkspaceCatalog {
++  workspaces: RuntimeWorkspace[]
++  capabilities?: WorkspaceCapabilities
++}
++export interface WorkspaceMetadata {
++  displayName: string
++  description: string
++  tags: string[]
++}
++export interface WorkspaceCreation extends WorkspaceMetadata { id: string }
++export interface WorkspaceOperation {
++  id: string
++  state: 'pending' | 'running' | 'succeeded' | 'failed'
++  workspaceId: string
++  errorCode?: string | null
++  retryable?: boolean
++}
++export class WorkspaceManagementError extends Error {
++  constructor(public readonly code: string, public readonly retryable: boolean, public readonly uncertain = false) {
++    super(code)
++    this.name = 'WorkspaceManagementError'
++  }
++}
++
++// Never reuse the worker client: discovery and management stay at the gateway
++// root even when a worker is asleep or the page uses a scoped API prefix.
++async function request<T>(path: string, method = 'GET', body?: unknown, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
++  const controller = new AbortController()
++  const timer = setTimeout(() => controller.abort(), 15000)
++  const abort = () => controller.abort()
++  signal?.addEventListener('abort', abort, { once: true })
++  if (signal?.aborted) controller.abort()
++  const headers: Record<string, string> = { Accept: 'application/json' }
++  const apiKey = useSettingsStore.getState().apiKey
++  if (apiKey) headers['X-API-Key'] = apiKey
++  try {
++    const token = localStorage.getItem('LIGHTRAG-API-TOKEN')
++    if (token) headers.Authorization = `Bearer ${token}`
++  } catch { /* Storage may be unavailable; the server still decides access. */ }
++  if (body !== undefined) headers['Content-Type'] = 'application/json'
++  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey
++  try {
++    const response = await fetch(path, {
++      method, headers, body: body === undefined ? undefined : JSON.stringify(body),
++      credentials: 'same-origin', cache: 'no-store', signal: controller.signal
++    })
++    const data = await response.json().catch(() => null)
++    if (!response.ok) {
++      const error = data?.detail && typeof data.detail === 'object' ? data.detail : data
++      throw new WorkspaceManagementError(typeof error?.code === 'string' ? error.code : `http_${response.status}`, error?.retryable === true)
++    }
++    if (!data || typeof data !== 'object') throw new WorkspaceManagementError('invalid_response', false, method !== 'GET')
++    return data as T
++  } catch (error) {
++    if (error instanceof WorkspaceManagementError) throw error
++    throw new WorkspaceManagementError('connection', true, method !== 'GET')
++  } finally { clearTimeout(timer); signal?.removeEventListener('abort', abort) }
++}
++
++export async function getWorkspaceCatalog(signal?: AbortSignal): Promise<WorkspaceCatalog> {
++  const data = await request<WorkspaceCatalog>('/workspaces', 'GET', undefined, undefined, signal)
++  if (!Array.isArray(data.workspaces) || !data.workspaces.every((row) => typeof row.id === 'string')) {
++    throw new WorkspaceManagementError('invalid_response', false)
++  }
++  return data
++}
++export async function createWorkspace(body: WorkspaceCreation, key: string): Promise<WorkspaceOperation> {
++  return validateOperation(await request<WorkspaceOperation>('/workspaces', 'POST', body, key), body.id)
++}
++export async function getWorkspaceOperation(id: string, workspaceId: string, signal?: AbortSignal): Promise<WorkspaceOperation> {
++  return validateOperation(await request<WorkspaceOperation>(`/workspace-operations/${encodeURIComponent(id)}`, 'GET', undefined, undefined, signal), workspaceId)
++}
++function validateOperation(data: WorkspaceOperation, workspaceId: string): WorkspaceOperation {
++  if (!data.id || data.workspaceId !== workspaceId || !['pending', 'running', 'succeeded', 'failed'].includes(data.state)) {
++    throw new WorkspaceManagementError('invalid_response', false, true)
++  }
++  return data
++}
++export function updateWorkspaceMetadata(id: string, body: WorkspaceMetadata): Promise<WorkspaceMetadata> {
++  return request(`/workspaces/${encodeURIComponent(id)}/metadata`, 'PATCH', body)
++}
++export function prewarmWorkspace(id: string): Promise<RuntimeWorkspace> {
++  return request(`/workspaces/${encodeURIComponent(id)}/prewarm`, 'POST')
++}
+diff --git a/lightrag_webui/src/components/WorkspaceCatalog.test.tsx b/lightrag_webui/src/components/WorkspaceCatalog.test.tsx
+new file mode 100644
+index 0000000..9b1939f
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceCatalog.test.tsx
+@@ -0,0 +1,206 @@
++import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
++import { cleanup, screen, waitFor, within } from '@testing-library/react'
++import userEvent from '@testing-library/user-event'
++import { renderWithProviders } from '@/test/render'
++import WorkspaceSelector from './WorkspaceSelector'
++import { WORKSPACE_CREATION_KEY, WORKSPACE_FAVORITES_KEY } from '@/lib/workspaceCatalog'
++import type { RuntimeWorkspace } from '@/lib/runtimeConfig'
++
++const originalConfig = window.__LIGHTRAG_CONFIG__
++const originalUrl = window.location.href
++const initial: RuntimeWorkspace[] = [
++  { id: 'default', documents: 5, processed: 5, failed: 0, pending: 0, processing: 0, readOnly: false, state: 'ready', displayName: 'Main library', description: 'Reference documents', tags: ['reference'] },
++  { id: 'research', documents: 2, processed: 2, failed: 0, pending: 0, processing: 0, readOnly: false, state: 'stopped', displayName: 'Research notes', description: 'Ocean research', tags: ['marine'] }
++]
++const capabilities = { management: true, metadata: true, create: true, prewarm: true }
++let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, 'fetch'>>
++let assign: ReturnType<typeof spyOn<typeof window.location, 'assign'>>
++let rows: RuntimeWorkspace[]
++let requests: { path: string; init?: RequestInit }[]
++let handler: (path: string, init?: RequestInit) => Response | Promise<Response>
++function json(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } }) }
++beforeEach(() => {
++  rows = initial.map((row) => ({ ...row }))
++  requests = []
++  window.__LIGHTRAG_CONFIG__ = { workspaceId: 'default', defaultWorkspace: 'default', workspaces: rows }
++  window.history.replaceState(null, '', '/workspaces/default/webui/')
++  localStorage.removeItem(WORKSPACE_FAVORITES_KEY)
++  sessionStorage.removeItem(WORKSPACE_CREATION_KEY)
++  handler = () => json({ workspaces: rows, capabilities })
++  fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
++    const path = String(input); requests.push({ path, init }); return handler(path, init)
++  }) as typeof fetch)
++  assign = spyOn(window.location, 'assign').mockImplementation(() => {})
++})
++afterEach(() => {
++  cleanup(); fetchSpy.mockRestore(); assign.mockRestore()
++  localStorage.removeItem(WORKSPACE_FAVORITES_KEY); sessionStorage.removeItem(WORKSPACE_CREATION_KEY)
++  window.__LIGHTRAG_CONFIG__ = originalConfig
++  window.history.replaceState(null, '', originalUrl)
++})
++async function openCatalog() {
++  const user = userEvent.setup()
++  renderWithProviders(<WorkspaceSelector />)
++  await user.click(screen.getByRole('button', { name: 'Your workspaces' }))
++  await screen.findByRole('button', { name: 'New workspace' })
++  return user
++}
++
++describe('workspace catalog', () => {
++  test('searches names, descriptions and tags, keeps favorites separate from retrieval history', async () => {
++    localStorage.setItem('webui-retrieval-history', '["keep-this-history"]')
++    const user = await openCatalog()
++    await user.type(screen.getByRole('searchbox'), 'marine')
++    expect(screen.getByRole('heading', { name: 'Research notes' })).toBeInTheDocument()
++    expect(screen.queryByRole('heading', { name: 'Main library' })).not.toBeInTheDocument()
++    await user.click(screen.getByRole('button', { name: 'Favorite Research notes' }))
++    expect(JSON.parse(localStorage.getItem(WORKSPACE_FAVORITES_KEY)!)).toEqual(['research'])
++    expect(localStorage.getItem('webui-retrieval-history')).toBe('["keep-this-history"]')
++    await user.clear(screen.getByRole('searchbox'))
++    await user.click(screen.getByRole('checkbox', { name: 'Favorites only' }))
++    expect(screen.queryByRole('heading', { name: 'Main library' })).not.toBeInTheDocument()
++    await user.click(screen.getByRole('button', { name: 'Open workspace' }))
++    expect(assign).toHaveBeenCalledWith('/workspaces/research/webui/')
++    expect(window.__LIGHTRAG_CONFIG__?.workspaceId).toBe('default')
++    expect(requests.every(({ init }) => init?.method === 'GET')).toBe(true)
++    localStorage.removeItem('webui-retrieval-history')
++  })
++  test('refresh discovers new workspaces without changing selected ID or automatically starting workers', async () => {
++    const user = await openCatalog()
++    rows.push({ ...initial[1], id: 'new-library', displayName: 'New library' })
++    await user.click(screen.getByRole('button', { name: 'Refresh workspaces' }))
++    await screen.findByRole('heading', { name: 'New library' })
++    expect(window.__LIGHTRAG_CONFIG__?.workspaceId).toBe('default')
++    expect(assign).not.toHaveBeenCalled()
++    expect(requests.every(({ path, init }) => path === '/workspaces' && init?.method === 'GET')).toBe(true)
++  })
++  test('capability-disabled servers retain catalog and switching but hide writes', async () => {
++    handler = () => json({ workspaces: rows })
++    const user = userEvent.setup()
++    renderWithProviders(<WorkspaceSelector />)
++    await user.click(screen.getByRole('button', { name: 'Your workspaces' }))
++    expect(screen.queryByRole('button', { name: 'New workspace' })).not.toBeInTheDocument()
++    expect(screen.queryByRole('button', { name: 'Edit Main library' })).not.toBeInTheDocument()
++    await user.click(screen.getByRole('button', { name: 'Open workspace' }))
++    expect(assign).toHaveBeenCalledWith('/workspaces/research/webui/')
++  })
++  test('metadata edit uses the immutable ID and does not move stored data', async () => {
++    handler = (path, init) => {
++      if (init?.method === 'PATCH') {
++        expect(path).toBe('/workspaces/research/metadata')
++        const data = JSON.parse(String(init.body))
++        expect(data).toEqual({ displayName: 'Marine library', description: 'Ocean research', tags: ['marine'] })
++        rows[1] = { ...rows[1], ...data }
++        return json(data)
++      }
++      return json({ workspaces: rows, capabilities })
++    }
++    const user = await openCatalog()
++    await user.click(screen.getByRole('button', { name: 'Edit Research notes' }))
++    expect(screen.getByLabelText('Workspace ID', { exact: false })).toHaveAttribute('readonly')
++    const name = screen.getByLabelText('Name', { exact: true })
++    await user.clear(name); await user.type(name, 'Marine library')
++    await user.click(screen.getByRole('button', { name: 'Save details' }))
++    await screen.findByRole('heading', { name: 'Marine library' })
++    expect(requests.filter(({ init }) => init?.method === 'PATCH')).toHaveLength(1)
++    expect(assign).not.toHaveBeenCalled()
++  })
++  test('create follows operation progress and refreshes catalog before opening', async () => {
++    let polls = 0
++    handler = (path, init) => {
++      if (init?.method === 'POST') return json({ id: 'operation-1', state: 'pending', workspaceId: 'ocean-notes' }, 202)
++      if (path === '/workspace-operations/operation-1') {
++        polls++
++        rows.push({ ...initial[1], id: 'ocean-notes', displayName: 'Ocean notes', documents: 0 })
++        return json({ id: 'operation-1', state: 'succeeded', workspaceId: 'ocean-notes' })
++      }
++      return json({ workspaces: rows, capabilities })
++    }
++    const user = await openCatalog()
++    await user.click(screen.getByRole('button', { name: 'New workspace' }))
++    await user.type(screen.getByLabelText('Name', { exact: true }), 'Ocean notes')
++    await user.type(screen.getByLabelText('Workspace ID', { exact: false }), 'ocean-notes')
++    await user.click(screen.getByRole('button', { name: 'Create workspace' }))
++    await screen.findByText('Workspace created. It is ready to open.')
++    await screen.findByRole('heading', { name: 'Ocean notes' })
++    const creation = screen.getByRole('region', { name: 'Workspace creation' })
++    await user.click(within(creation).getByRole('button', { name: 'Open workspace' }))
++    expect(assign).toHaveBeenCalledWith('/workspaces/ocean-notes/webui/')
++    expect(polls).toBe(1)
++    expect(requests.filter(({ init }) => init?.method === 'POST')).toHaveLength(1)
++  })
++  test('lost create response keeps its exact request key and body; no automatic duplicate submission', async () => {
++    let posts = 0
++    handler = (_path, init) => {
++      if (init?.method === 'POST') {
++        posts++
++        if (posts === 1) throw new TypeError('connection lost')
++        return json({ id: 'recovered-operation', state: 'succeeded', workspaceId: 'ocean-notes' }, 202)
++      }
++      return json({ workspaces: rows, capabilities })
++    }
++    const user = await openCatalog()
++    await user.click(screen.getByRole('button', { name: 'New workspace' }))
++    await user.type(screen.getByLabelText('Workspace ID', { exact: false }), 'ocean-notes')
++    await user.click(screen.getByRole('button', { name: 'Create workspace' }))
++    await screen.findByText(/connection ended before creation was confirmed/i)
++    expect(posts).toBe(1)
++    const stored = JSON.parse(sessionStorage.getItem(WORKSPACE_CREATION_KEY)!)
++    expect(stored.body.id).toBe('ocean-notes')
++    await user.click(screen.getByRole('button', { name: 'Retry same creation' }))
++    await screen.findByText('Workspace created. It is ready to open.')
++    const writes = requests.filter(({ init }) => init?.method === 'POST')
++    expect(writes[0].init?.body).toBe(writes[1].init?.body)
++    expect((writes[0].init?.headers as Record<string, string>)['Idempotency-Key']).toBe(stored.key)
++    expect((writes[1].init?.headers as Record<string, string>)['Idempotency-Key']).toBe(stored.key)
++  })
++
++
++  test('closing the catalog aborts an operation poll without repeating creation', async () => {
++    let pollSignal: AbortSignal | undefined
++    handler = (path, init) => {
++      if (init?.method === 'POST') return json({ id: 'waiting-operation', state: 'running', workspaceId: 'ocean-notes' }, 202)
++      if (path === '/workspace-operations/waiting-operation') {
++        pollSignal = init?.signal || undefined
++        return new Promise<Response>((_resolve, reject) => {
++          pollSignal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
++        })
++      }
++      return json({ workspaces: rows, capabilities })
++    }
++    const user = await openCatalog()
++    await user.click(screen.getByRole('button', { name: 'New workspace' }))
++    await user.type(screen.getByLabelText('Workspace ID', { exact: false }), 'ocean-notes')
++    await user.click(screen.getByRole('button', { name: 'Create workspace' }))
++    await waitFor(() => expect(pollSignal).toBeDefined())
++    await user.click(screen.getByRole('button', { name: /^Close$/ }))
++    expect(pollSignal?.aborted).toBe(true)
++    expect(requests.filter(({ init }) => init?.method === 'POST')).toHaveLength(1)
++    expect(JSON.parse(sessionStorage.getItem(WORKSPACE_CREATION_KEY)!).operation.id).toBe('waiting-operation')
++  })
++  test('a rejected validation can be edited, while an accepted request keeps its key', async () => {
++    handler = (_path, init) => init?.method === 'POST'
++      ? json({ code: 'invalid_metadata', retryable: false, detail: 'invalid' }, 422)
++      : json({ workspaces: rows, capabilities })
++    const user = await openCatalog()
++    await user.click(screen.getByRole('button', { name: 'New workspace' }))
++    await user.type(screen.getByLabelText('Workspace ID', { exact: false }), 'new-notes')
++    await user.click(screen.getByRole('button', { name: 'Create workspace' }))
++    await screen.findByRole('button', { name: 'Edit request' })
++    expect(screen.queryByRole('button', { name: 'Retry same creation' })).not.toBeInTheDocument()
++    await user.click(screen.getByRole('button', { name: 'Edit request' }))
++    expect(screen.getByLabelText('Workspace ID', { exact: false })).not.toHaveAttribute('readonly')
++    expect(screen.getByLabelText('Workspace ID', { exact: false })).toHaveValue('new-notes')
++    expect(sessionStorage.getItem(WORKSPACE_CREATION_KEY)).toBeNull()
++    expect(requests.filter(({ init }) => init?.method === 'POST')).toHaveLength(1)
++  })
++  test('failed discovery keeps the previous list and offers refresh', async () => {
++    handler = () => json({ detail: 'private database string should not display' }, 503)
++    const user = userEvent.setup()
++    renderWithProviders(<WorkspaceSelector />)
++    await user.click(screen.getByRole('button', { name: 'Your workspaces' }))
++    await waitFor(() => expect(screen.getByText(/Showing the last available list/)).toBeInTheDocument())
++    expect(screen.getByRole('heading', { name: 'Research notes' })).toBeInTheDocument()
++    expect(screen.queryByText(/private database/)).not.toBeInTheDocument()
++  })
++})
+diff --git a/lightrag_webui/src/components/WorkspaceCatalog.tsx b/lightrag_webui/src/components/WorkspaceCatalog.tsx
+new file mode 100644
+index 0000000..b1e82fd
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceCatalog.tsx
+@@ -0,0 +1,227 @@
++import { useEffect, useRef, useState } from 'react'
++import { useTranslation } from 'react-i18next'
++import { ArrowLeft, FolderPlus, Pencil, RefreshCw, Search, Star } from 'lucide-react'
++import Button from '@/components/ui/Button'
++import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/Dialog'
++import type { RuntimeWorkspace } from '@/lib/runtimeConfig'
++import { createWorkspace, getWorkspaceOperation, prewarmWorkspace, updateWorkspaceMetadata, WorkspaceManagementError, type WorkspaceCapabilities, type WorkspaceCreation } from '@/api/workspaces'
++import { clearPendingCreation, filterWorkspaces, readFavorites, readPendingCreation, saveFavorites, savePendingCreation, type PendingCreation } from '@/lib/workspaceCatalog'
++import WorkspaceState from './WorkspaceState'
++import WorkspaceIssue from './WorkspaceIssue'
++
++interface Props {
++  open: boolean
++  onOpenChange: (value: boolean) => void
++  workspaces: RuntimeWorkspace[]
++  currentId: string
++  capabilities: WorkspaceCapabilities
++  refreshing: boolean
++  stale: boolean
++  refresh: () => Promise<void>
++  select: (id: string) => void
++}
++const inputClass = 'border-input bg-background w-full rounded-md border px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
++const emptyForm: WorkspaceCreation = { id: '', displayName: '', description: '', tags: [] }
++
++export default function WorkspaceCatalog({ open, onOpenChange, workspaces, currentId, capabilities, refreshing, stale, refresh, select }: Props) {
++  const { t } = useTranslation()
++  const [query, setQuery] = useState('')
++  const [favorites, setFavorites] = useState(readFavorites)
++  const [onlyFavorites, setOnlyFavorites] = useState(false)
++  const [editor, setEditor] = useState<string | null>(null)
++  const [form, setForm] = useState<WorkspaceCreation>(emptyForm)
++  const [tagText, setTagText] = useState('')
++  const [pending, setPending] = useState<PendingCreation | undefined>(readPendingCreation)
++  const [working, setWorking] = useState(false)
++  const [polling, setPolling] = useState(false)
++  const [error, setError] = useState<string | null>(null)
++  const [notice, setNotice] = useState<string | null>(null)
++  const alive = useRef(true)
++  const submission = useRef(false)
++  const canCreate = capabilities.management && capabilities.create
++  const canEdit = capabilities.management && capabilities.metadata
++  useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
++  useEffect(() => {
++    const onStorage = (event: StorageEvent) => { if (event.key === 'lightrag:workspace-catalog:favorites:v1') setFavorites(readFavorites()) }
++    window.addEventListener('storage', onStorage)
++    return () => window.removeEventListener('storage', onStorage)
++  }, [])
++  useEffect(() => {
++    if (!open) return
++    void refresh()
++  }, [open, refresh])
++  // Poll only a known operation. A lost POST response is never automatically
++  // repeated: the user can explicitly retry the same durable request key.
++  const operationId = pending?.operation?.id
++  const operationState = pending?.operation?.state
++  const pendingWorkspaceId = pending?.body.id
++  useEffect(() => {
++    if (!open || !operationId || !pendingWorkspaceId || !['pending', 'running'].includes(operationState || '')) return
++    let cancelled = false
++    const controller = new AbortController()
++    let timer: ReturnType<typeof setTimeout>
++    const deadline = Date.now() + 120000
++    const poll = async () => {
++      if (cancelled) return
++      try {
++        const operation = await getWorkspaceOperation(operationId, pendingWorkspaceId, controller.signal)
++        if (cancelled) return
++        setPending((previous) => {
++          if (!previous || previous.key !== pending?.key) return previous
++          const next = { ...previous, operation }
++          savePendingCreation(next)
++          return next
++        })
++        if (operation.state === 'succeeded') { setPolling(false); await refresh(); return }
++        if (operation.state === 'failed') { setPolling(false); return }
++        if (Date.now() >= deadline) { setError('stillWorking'); setPolling(false); return }
++        timer = setTimeout(poll, 2000)
++      } catch {
++        if (!cancelled) { setError('checkFailed'); setPolling(false) }
++      }
++    }
++    timer = setTimeout(() => { if (!cancelled) { setPolling(true); void poll() } }, 0)
++    return () => { cancelled = true; controller.abort(); clearTimeout(timer) }
++  }, [open, operationId, operationState, pendingWorkspaceId, pending?.key, refresh])
++
++  function startEditor(workspace?: RuntimeWorkspace) {
++    setError(null); setNotice(null)
++    setEditor(workspace?.id || '__new__')
++    setForm(workspace ? { id: workspace.id, displayName: workspace.displayName || workspace.id, description: workspace.description || '', tags: workspace.tags || [] } : emptyForm)
++    setTagText((workspace?.tags || []).join(', '))
++  }
++  function toggleFavorite(id: string) {
++    const next = favorites.includes(id) ? favorites.filter((value) => value !== id) : [...favorites, id]
++    setFavorites(next)
++    if (!saveFavorites(next)) setNotice('storageUnavailable')
++  }
++  function validTags() {
++    const tags = tagText.split(',').map((tag) => tag.trim()).filter(Boolean)
++    if (tags.length > 20 || tags.some((tag) => tag.length > 48)) { setError('invalidTags'); return false }
++    return true
++  }
++  async function submitCreation(intent?: PendingCreation) {
++    if (submission.current) return
++    submission.current = true
++    setWorking(true); setError(null)
++    try {
++      if (!intent && !validTags()) return
++      const body = { ...form, displayName: form.displayName.trim() || form.id, description: form.description.trim(), tags: tagText.split(',').map((tag) => tag.trim()).filter(Boolean) }
++      const next = intent || { key: Array.from(crypto.getRandomValues(new Uint8Array(24)), (byte) => byte.toString(16).padStart(2, '0')).join(''), body }
++      // Refuse a new write without durable retry identity. Existing intent stays
++      // in memory even if browser storage becomes unavailable afterwards.
++      if (!intent && !savePendingCreation(next)) { setError('saveRequestFailed'); return }
++      setPending(next)
++      const operation = await createWorkspace(next.body, next.key)
++      const saved = { ...next, operation }
++      savePendingCreation(saved)
++      if (alive.current) { setPending(saved); setEditor(null) }
++      if (operation.state === 'succeeded') await refresh()
++    } catch (cause) {
++      // These gateway validations run before accepting a creation operation.
++      // An explicit edit may use a fresh key; transport failures keep the old one.
++      if (cause instanceof WorkspaceManagementError && ['invalid_metadata', 'invalid_workspace_id', 'authentication_required', 'workspace_exists', 'json_required', 'request_too_large'].includes(cause.code)) {
++        setPending((previous) => {
++          if (!previous || previous.operation) return previous
++          const rejected = { ...previous, rejectionCode: cause.code }
++          savePendingCreation(rejected)
++          return rejected
++        })
++      }
++      if (alive.current) setError(cause instanceof WorkspaceManagementError && !cause.uncertain ? 'creationRejected' : 'creationUncertain')
++    } finally { submission.current = false; if (alive.current) setWorking(false) }
++  }
++  async function saveMetadata() {
++    if (submission.current) return
++    submission.current = true; setWorking(true); setError(null)
++    try {
++      if (!validTags()) return
++      await updateWorkspaceMetadata(form.id, { displayName: form.displayName.trim() || form.id, description: form.description.trim(), tags: tagText.split(',').map((tag) => tag.trim()).filter(Boolean) })
++      await refresh()
++      if (alive.current) { setEditor(null); setNotice('metadataSaved') }
++    } catch { if (alive.current) setError('metadataFailed') }
++    finally { submission.current = false; if (alive.current) setWorking(false) }
++  }
++  async function checkCreation() {
++    if (!pending?.operation) return
++    setWorking(true); setError(null)
++    try {
++      const operation = await getWorkspaceOperation(pending.operation.id, pending.body.id)
++      const next = { ...pending, operation }
++      savePendingCreation(next)
++      if (alive.current) setPending(next)
++      await refresh()
++    } catch { if (alive.current) setError('checkFailed') }
++    finally { if (alive.current) setWorking(false) }
++  }
++  async function startWorkspace(id: string) {
++    setWorking(true); setError(null)
++    try { await prewarmWorkspace(id); await refresh() }
++    catch { if (alive.current) setError('startFailed') }
++    finally { if (alive.current) setWorking(false) }
++  }
++  const rows = filterWorkspaces(workspaces, query, favorites, onlyFavorites)
++  return <Dialog open={open} onOpenChange={onOpenChange}>
++    <DialogContent className="max-h-[90dvh] max-w-2xl overflow-y-auto p-5 sm:p-6">
++      <DialogHeader>
++        <DialogTitle>{t('workspace.catalog.title', 'Your workspaces')}</DialogTitle>
++        <DialogDescription>{t('workspace.catalog.description', 'Find a collection of documents, or create a separate space for a new topic.')}</DialogDescription>
++      </DialogHeader>
++      {error && <p role="alert" className="rounded-md bg-red-50 p-3 text-sm text-red-900 dark:bg-red-950 dark:text-red-100">{t(`workspace.catalog.errors.${error}`)}</p>}
++      {notice && <p role="status" className="text-muted-foreground text-sm">{t(`workspace.catalog.${notice}`)}</p>}
++      {pending && <section aria-label={t('workspace.catalog.creation', 'Workspace creation')} className="bg-muted/50 rounded-lg border p-3">
++        <p className="text-sm font-medium">{pending.body.displayName || pending.body.id}</p>
++        <p className="text-muted-foreground mt-1 text-sm" role="status">{t(`workspace.catalog.operation.${pending.operation?.state || 'unknown'}`)}</p>
++        {pending.rejectionCode && <p className="mt-2 text-xs"><WorkspaceIssue code={pending.rejectionCode} retryable={false} /></p>}
++        {pending.operation?.state === 'failed' && <p className="mt-2 text-xs"><WorkspaceIssue code={pending.operation.errorCode} retryable={pending.operation.retryable} /></p>}
++        <div className="mt-3 flex flex-wrap gap-2">
++          {pending.operation?.state === 'succeeded' ? <>
++            <Button size="sm" onClick={() => select(pending.body.id)}>{t('workspace.catalog.open', 'Open workspace')}</Button>
++            <Button size="sm" variant="ghost" onClick={() => { clearPendingCreation(); setPending(undefined); setError(null) }}>{t('workspace.catalog.done', 'Done')}</Button>
++          </> : <>
++            {pending.rejectionCode && <Button size="sm" variant="outline" disabled={working} onClick={() => { setForm(pending.body); setTagText(pending.body.tags.join(', ')); clearPendingCreation(); setPending(undefined); setEditor('__new__'); setError(null) }}>{t('workspace.catalog.editRequest', 'Edit request')}</Button>}
++            {pending.operation && <Button size="sm" variant="outline" disabled={working || polling} onClick={() => { void checkCreation() }}>{t('workspace.catalog.check', 'Check progress')}</Button>}
++            {pending.operation?.state === 'failed' && <Button size="sm" variant="ghost" disabled={working} onClick={() => { clearPendingCreation(); setPending(undefined); setError(null) }}>{t('workspace.catalog.dismiss', 'Dismiss')}</Button>}
++            {(!pending.operation && !pending.rejectionCode || pending.operation?.state === 'failed' && pending.operation.retryable) && canCreate && <Button size="sm" variant="outline" disabled={working || polling} onClick={() => { void submitCreation(pending) }}>{t('workspace.catalog.retryCreation', 'Retry same creation')}</Button>}
++          </>}
++        </div>
++      </section>}
++      {editor ? <form onSubmit={(event) => { event.preventDefault(); if (editor === '__new__') void submitCreation(); else void saveMetadata() }} className="flex flex-col gap-4">
++        <Button type="button" size="sm" variant="ghost" className="self-start" disabled={working} onClick={() => { setEditor(null); setError(null) }}><ArrowLeft />{t('workspace.catalog.back', 'Back to workspaces')}</Button>
++        <label className="text-sm font-medium">{t('workspace.catalog.name', 'Name')}<input className={`${inputClass} mt-1`} value={form.displayName} maxLength={160} onChange={(event) => setForm({ ...form, displayName: event.target.value })} /></label>
++        <label className="text-sm font-medium">{t('workspace.catalog.id', 'Workspace ID')}<input className={`${inputClass} mt-1`} value={form.id} required pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}" maxLength={128} readOnly={editor !== '__new__' || Boolean(pending)} disabled={working} onChange={(event) => setForm({ ...form, id: event.target.value })} /><span className="text-muted-foreground mt-1 block text-xs">{t('workspace.catalog.idHelp', 'A permanent address: lowercase letters, numbers and hyphens. It cannot be renamed.')}</span></label>
++        <label className="text-sm font-medium">{t('workspace.catalog.about', 'Description')}<textarea className={`${inputClass} mt-1 min-h-20`} value={form.description} maxLength={2000} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
++        <label className="text-sm font-medium">{t('workspace.catalog.tags', 'Tags')}<input className={`${inputClass} mt-1`} value={tagText} maxLength={1000} onChange={(event) => setTagText(event.target.value)} placeholder={t('workspace.catalog.tagsHint', 'Separate tags with commas')} /></label>
++        <Button type="submit" disabled={working || Boolean(pending) && editor === '__new__'} className="self-start">{working ? t('workspace.catalog.saving', 'Saving…') : editor === '__new__' ? t('workspace.catalog.create', 'Create workspace') : t('workspace.catalog.save', 'Save details')}</Button>
++      </form> : <>
++        <div className="flex flex-wrap items-center gap-2">
++          <div className="relative min-w-40 flex-1"><Search className="text-muted-foreground absolute top-2.5 left-3 size-4" aria-hidden="true" /><input type="search" aria-label={t('workspace.catalog.search', 'Search workspaces')} placeholder={t('workspace.catalog.search', 'Search workspaces')} className={`${inputClass} pl-9`} value={query} onChange={(event) => setQuery(event.target.value)} /></div>
++          <Button variant="outline" size="icon" aria-label={t('workspace.catalog.refresh', 'Refresh workspaces')} disabled={refreshing} onClick={() => { void refresh() }}><RefreshCw className={refreshing ? 'animate-spin' : ''} /></Button>
++          {canCreate && <Button size="sm" disabled={Boolean(pending)} onClick={() => startEditor()}><FolderPlus />{t('workspace.catalog.new', 'New workspace')}</Button>}
++        </div>
++        <label className="text-muted-foreground flex items-center gap-2 text-xs"><input type="checkbox" checked={onlyFavorites} onChange={(event) => setOnlyFavorites(event.target.checked)} />{t('workspace.catalog.favoritesOnly', 'Favorites only')}</label>
++        {stale && <p role="status" className="text-muted-foreground text-xs">{t('workspace.catalog.stale', 'Showing the last available list. Refresh to check for changes.')}</p>}
++        <div className="flex flex-col gap-2">
++          {rows.length === 0 && <p className="text-muted-foreground py-8 text-center text-sm">{t('workspace.catalog.noResults', 'No workspaces match your search.')}</p>}
++          {rows.map((row) => <article key={row.id} className={`rounded-lg border p-3 ${row.id === currentId ? 'border-primary/40 bg-primary/5' : ''}`}>
++            <div className="flex items-start gap-2">
++              <button type="button" aria-label={t('workspace.catalog.favorite', { defaultValue: 'Favorite {{name}}', name: row.displayName || row.id })} aria-pressed={favorites.includes(row.id)} onClick={() => toggleFavorite(row.id)} className="text-muted-foreground hover:text-primary rounded-md p-1 focus-visible:ring-2"><Star className={`size-4 ${favorites.includes(row.id) ? 'fill-amber-400 text-amber-500' : ''}`} /></button>
++              <div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><h3 className="break-words text-sm font-medium">{row.displayName || row.id}</h3><WorkspaceState workspace={row} />{row.id === currentId && <span className="text-muted-foreground text-xs">{t('workspace.catalog.current', 'Current')}</span>}</div>
++                {row.displayName && row.displayName !== row.id && <p className="text-muted-foreground break-all text-xs">{row.id}</p>}
++                {row.description && <p className="text-muted-foreground mt-1 line-clamp-3 whitespace-pre-wrap text-sm">{row.description}</p>}
++                <p className="text-muted-foreground mt-1 text-xs">{t('workspace.catalog.documents', { defaultValue: '{{count}} documents', count: row.documents })}{row.readOnly ? ` · ${t('workspace.switcher.readOnly', 'read only')}` : ''}</p>
++                {Boolean(row.tags?.length) && <div className="mt-2 flex flex-wrap gap-1">{row.tags?.map((tag) => <span key={tag} className="bg-muted rounded px-1.5 py-0.5 text-[11px]">{tag}</span>)}</div>}
++                {row.state === 'failed' && <p className="mt-2 text-xs text-red-700 dark:text-red-300"><WorkspaceIssue code={row.errorCode} retryable={row.retryable} retryAfterSeconds={row.retryAfterSeconds} /></p>}
++              </div>
++              {canEdit && <Button size="icon" variant="ghost" aria-label={t('workspace.catalog.edit', { defaultValue: 'Edit {{name}}', name: row.displayName || row.id })} onClick={() => startEditor(row)}><Pencil /></Button>}
++            </div>
++            <div className="mt-3 flex justify-end gap-2">
++              {capabilities.management && capabilities.prewarm && row.state === 'failed' && row.retryable && <Button size="sm" variant="outline" disabled={working} onClick={() => { void startWorkspace(row.id) }}>{t('workspace.catalog.startAgain', 'Try starting again')}</Button>}
++              {row.id !== currentId && <Button size="sm" variant="outline" onClick={() => select(row.id)}>{t('workspace.catalog.open', 'Open workspace')}</Button>}
++            </div>
++          </article>)}
++        </div>
++      </>}
++    </DialogContent>
++  </Dialog>
++}
+diff --git a/lightrag_webui/src/components/WorkspaceIssue.tsx b/lightrag_webui/src/components/WorkspaceIssue.tsx
+new file mode 100644
+index 0000000..ba93aa3
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceIssue.tsx
+@@ -0,0 +1,18 @@
++import { useTranslation } from 'react-i18next'
++
++const reasons: Record<string, string> = {
++  workspace_start_timeout: 'timeout', workspace_memory_unavailable: 'memory', workspace_capacity_busy: 'capacity',
++  workspace_process_exited: 'process', workspace_start_failed: 'process', workspace_spawn_failed: 'process',
++  database_unavailable: 'database', workspace_registration_invalid: 'registration', database_identity_mismatch: 'registration',
++  database_schema_not_ready: 'schema', database_migration_busy: 'maintenance', maintenance_active: 'maintenance', gateway_closing: 'maintenance',
++  authentication_required: 'authentication', authentication_unavailable: 'authentication', workspace_exists: 'exists',
++  invalid_workspace_id: 'invalidId', invalid_metadata: 'invalidMetadata', operation_interrupted: 'interrupted'
++}
++/** Only vetted messages are rendered; server logs, exception strings and URLs stay out of the UI. */
++export default function WorkspaceIssue({ code, retryable, retryAfterSeconds }: { code?: string | null; retryable?: boolean; retryAfterSeconds?: number | null }) {
++  const { t } = useTranslation()
++  const reason = code ? reasons[code] : undefined
++  return <span>{t(reason ? `workspace.catalog.reasons.${reason}` : retryable ? 'workspace.catalog.failedRetryable' : 'workspace.catalog.failedNeedsAttention')}
++    {retryable && retryAfterSeconds && retryAfterSeconds > 0 ? ` ${t('workspace.catalog.retryAfter', { count: Math.ceil(retryAfterSeconds) })}` : ''}
++  </span>
++}
 diff --git a/lightrag_webui/src/components/WorkspaceOpening.test.tsx b/lightrag_webui/src/components/WorkspaceOpening.test.tsx
 new file mode 100644
-index 0000000..5d4493a
+index 0000000..502d470
 --- /dev/null
 +++ b/lightrag_webui/src/components/WorkspaceOpening.test.tsx
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,82 @@
 +import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 +import { cleanup, screen } from '@testing-library/react'
 +import userEvent from '@testing-library/user-event'
@@ -428,12 +1116,30 @@ index 0000000..5d4493a
 +    }
 +  })
 +})
++
++
++describe('gateway startup diagnostics', () => {
++  test('shows the safe memory reason and retry advice', () => {
++    window.__LIGHTRAG_CONFIG__ = { workspaceId: 'research', workspaces: [{ id: 'research', documents: 1, processed: 1, failed: 0, pending: 0, processing: 0, readOnly: false }] }
++    renderWithProviders(<WorkspaceOpening error={new WorkspaceBootstrapError('unavailable', 503, 'workspace_memory_unavailable', true, 5)} />)
++    expect(screen.getByRole('alert')).toHaveTextContent('The server needs more free memory')
++    expect(screen.getByRole('alert')).toHaveTextContent('Try again after about 5 seconds.')
++    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
++  })
++  test('does not offer a meaningless retry for an invalid registration', () => {
++    window.__LIGHTRAG_CONFIG__ = { workspaceId: 'research', workspaces: [{ id: 'research', documents: 1, processed: 1, failed: 0, pending: 0, processing: 0, readOnly: false }] }
++    renderWithProviders(<WorkspaceOpening error={new WorkspaceBootstrapError('unavailable', 409, 'workspace_registration_invalid', false)} />)
++    expect(screen.getByRole('alert')).toHaveTextContent('registration needs inspection')
++    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument()
++    expect(screen.getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
++  })
++})
 diff --git a/lightrag_webui/src/components/WorkspaceOpening.tsx b/lightrag_webui/src/components/WorkspaceOpening.tsx
 new file mode 100644
-index 0000000..be751a3
+index 0000000..84a8e95
 --- /dev/null
 +++ b/lightrag_webui/src/components/WorkspaceOpening.tsx
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,72 @@
 +import { useTranslation } from 'react-i18next'
 +import { ZapIcon } from 'lucide-react'
 +import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
@@ -441,6 +1147,7 @@ index 0000000..be751a3
 +import WorkspaceReadOnlyNotice from './WorkspaceReadOnlyNotice'
 +import type { WorkspaceBootstrapError } from '@/api/errors'
 +import Button from '@/components/ui/Button'
++import WorkspaceIssue from './WorkspaceIssue'
 +
 +interface WorkspaceOpeningProps {
 +  error?: WorkspaceBootstrapError | null
@@ -462,10 +1169,10 @@ index 0000000..be751a3
 +        <p className="text-sm font-medium">
 +          {t('workspace.switcher.openingFailed', { defaultValue: 'Could not open workspace {{workspace}}', workspace: config.workspaceId })}
 +        </p>
-+        <p className="text-muted-foreground text-sm leading-relaxed">{explanation}</p>
-+        <Button type="button" variant="outline" onClick={() => window.location.reload()}>
++        <p className="text-muted-foreground text-sm leading-relaxed">{error.code ? <WorkspaceIssue code={error.code} retryable={error.retryable} retryAfterSeconds={error.retryAfterSeconds} /> : explanation}</p>
++        {error.retryable !== false && <Button type="button" variant="outline" onClick={() => window.location.reload()}>
 +          {t('workspace.switcher.retry', 'Try again')}
-+        </Button>
++        </Button>}
 +      </div>
 +    )
 +  }
@@ -631,25 +1338,31 @@ index 0000000..0927801
 +})
 diff --git a/lightrag_webui/src/components/WorkspaceSelector.tsx b/lightrag_webui/src/components/WorkspaceSelector.tsx
 new file mode 100644
-index 0000000..d2b9724
+index 0000000..72598c7
 --- /dev/null
 +++ b/lightrag_webui/src/components/WorkspaceSelector.tsx
-@@ -0,0 +1,44 @@
-+import { useId } from 'react'
+@@ -0,0 +1,53 @@
++import { useId, useState } from 'react'
 +import { useTranslation } from 'react-i18next'
-+import { ChevronDown } from 'lucide-react'
++import { ChevronDown, Search } from 'lucide-react'
 +import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
 +import { workspaceEntryPath } from '@/lib/workspaceRouting'
++import { useWorkspaceCatalog } from '@/hooks/useWorkspaceCatalog'
++import WorkspaceCatalog from './WorkspaceCatalog'
++import WorkspaceState from './WorkspaceState'
++import Button from './ui/Button'
 +
 +export default function WorkspaceSelector() {
 +  const { t } = useTranslation()
 +  const id = useId()
 +  const config = getRuntimeWorkspaceConfig()
++  const catalog = useWorkspaceCatalog()
++  const [catalogOpen, setCatalogOpen] = useState(false)
 +  if (!config) return null
 +
 +  const changeWorkspace = (workspaceId: string) => {
 +    if (workspaceId === config.workspaceId) return
-+    if (!config.workspaces.some((workspace) => workspace.id === workspaceId)) return
++    if (!catalog.workspaces.some((workspace) => workspace.id === workspaceId)) return
 +    // Navigation destroys the old query, document and graph state. The URL,
 +    // rather than a shared cookie or localStorage choice, keeps tabs isolated.
 +    window.location.assign(workspaceEntryPath(workspaceId, window.location.pathname))
@@ -668,16 +1381,41 @@ index 0000000..d2b9724
 +          onChange={(event) => changeWorkspace(event.target.value)}
 +          className="border-input bg-background text-foreground focus-visible:ring-ring h-8 max-w-[10rem] min-w-24 cursor-pointer appearance-none truncate rounded-md border py-1 pr-7 pl-2 text-xs focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none sm:max-w-[13rem]"
 +        >
-+          {config.workspaces.map((workspace) => (
++          {catalog.workspaces.map((workspace) => (
 +            <option key={workspace.id} value={workspace.id}>
-+              {workspace.id} ({workspace.documents}){workspace.readOnly ? ` — ${t('workspace.switcher.readOnly', 'read only')}` : ''}
++              {workspace.displayName || workspace.id} ({workspace.documents}){workspace.readOnly ? ` — ${t('workspace.switcher.readOnly', 'read only')}` : ''}
 +            </option>
 +          ))}
 +        </select>
 +        <ChevronDown className="text-muted-foreground pointer-events-none absolute top-2 right-2 size-4" aria-hidden="true" />
 +      </div>
++      <span className="hidden xl:inline-flex"><WorkspaceState workspace={catalog.workspaces.find((row) => row.id === config.workspaceId)} /></span>
++      <Button size="icon" variant="ghost" tooltip={t('workspace.catalog.title', 'Your workspaces')} aria-label={t('workspace.catalog.title', 'Your workspaces')} onClick={() => setCatalogOpen(true)}><Search /></Button>
++      <WorkspaceCatalog open={catalogOpen} onOpenChange={setCatalogOpen} {...catalog} currentId={config.workspaceId} select={changeWorkspace} />
 +    </div>
 +  )
++}
+diff --git a/lightrag_webui/src/components/WorkspaceState.tsx b/lightrag_webui/src/components/WorkspaceState.tsx
+new file mode 100644
+index 0000000..71c477d
+--- /dev/null
++++ b/lightrag_webui/src/components/WorkspaceState.tsx
+@@ -0,0 +1,16 @@
++import { useTranslation } from 'react-i18next'
++import type { RuntimeWorkspace } from '@/lib/runtimeConfig'
++
++const colors: Record<string, string> = {
++  stopped: 'bg-muted text-muted-foreground', starting: 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-200',
++  ready: 'bg-emerald-100 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-200',
++  busy: 'bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200',
++  failed: 'bg-red-100 text-red-900 dark:bg-red-950 dark:text-red-200'
++}
++export default function WorkspaceState({ workspace }: { workspace?: RuntimeWorkspace }) {
++  const { t } = useTranslation()
++  if (!workspace?.state) return null
++  return <span className={`inline-flex shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium ${colors[workspace.state] || colors.stopped}`}>
++    {t(`workspace.catalog.states.${workspace.state}`, workspace.state)}
++  </span>
 +}
 diff --git a/lightrag_webui/src/components/status/StatusCard.test.tsx b/lightrag_webui/src/components/status/StatusCard.test.tsx
 new file mode 100644
@@ -1299,11 +2037,133 @@ index 5828bc9..7d0646d 100644
      expect(documentManagerSource).toContain(
        'pipelineActive, pageRestoreGeneration, startPollingInterval'
      )
+diff --git a/lightrag_webui/src/hooks/useWorkspaceCatalog.test.ts b/lightrag_webui/src/hooks/useWorkspaceCatalog.test.ts
+new file mode 100644
+index 0000000..28acb31
+--- /dev/null
++++ b/lightrag_webui/src/hooks/useWorkspaceCatalog.test.ts
+@@ -0,0 +1,51 @@
++import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
++import { act, cleanup, renderHook } from '@testing-library/react'
++import { useWorkspaceCatalog } from './useWorkspaceCatalog'
++
++const originalConfig = window.__LIGHTRAG_CONFIG__
++const nativeTimeout = globalThis.setTimeout
++let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, 'fetch'>>
++let timerSpy: ReturnType<typeof spyOn<typeof globalThis, 'setTimeout'>>
++let queued: (() => void)[]
++beforeEach(() => {
++  cleanup()
++  window.__LIGHTRAG_CONFIG__ = { workspaceId: 'default', workspaces: [{ id: 'default', documents: 0, processed: 0, failed: 0, pending: 0, processing: 0, readOnly: false }] }
++  queued = []
++  timerSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
++    if (delay === 0 && typeof handler === 'function') { queued.push(() => handler(...args)); return 0 }
++    return nativeTimeout(handler, delay, ...args)
++  }) as typeof setTimeout)
++  fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ workspaces: [] }), { headers: { 'Content-Type': 'application/json' } }))
++})
++afterEach(() => {
++  cleanup(); timerSpy.mockRestore(); fetchSpy.mockRestore(); window.__LIGHTRAG_CONFIG__ = originalConfig
++})
++describe('catalog refresh ownership', () => {
++  test('an already queued callback cannot fetch after unmount, even if a new selector mounts', async () => {
++    const first = renderHook(() => useWorkspaceCatalog())
++    const firstCallback = queued[0]
++    expect(firstCallback).toBeDefined()
++    first.unmount()
++    const second = renderHook(() => useWorkspaceCatalog())
++    await act(async () => { firstCallback() })
++    expect(fetchSpy).not.toHaveBeenCalled()
++    second.unmount()
++  })
++  test('unmount aborts an in-flight discovery request and removes its focus callback', async () => {
++    let signal: AbortSignal | undefined
++    fetchSpy.mockImplementation((async (_url: RequestInfo | URL, init?: RequestInit) => {
++      signal = init?.signal || undefined
++      return new Promise<Response>((_resolve, reject) => {
++        signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
++      })
++    }) as typeof fetch)
++    const view = renderHook(() => useWorkspaceCatalog())
++    act(() => { queued[0]() })
++    expect(fetchSpy).toHaveBeenCalledTimes(1)
++    expect(signal?.aborted).toBe(false)
++    view.unmount()
++    expect(signal?.aborted).toBe(true)
++    await act(async () => { window.dispatchEvent(new Event('focus')) })
++    expect(fetchSpy).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/lightrag_webui/src/hooks/useWorkspaceCatalog.ts b/lightrag_webui/src/hooks/useWorkspaceCatalog.ts
+new file mode 100644
+index 0000000..7a8be33
+--- /dev/null
++++ b/lightrag_webui/src/hooks/useWorkspaceCatalog.ts
+@@ -0,0 +1,59 @@
++import { useCallback, useEffect, useRef, useState } from 'react'
++import { getWorkspaceCatalog, type WorkspaceCapabilities } from '@/api/workspaces'
++import { getRuntimeWorkspaceConfig } from '@/lib/runtimeConfig'
++
++/** Refresh display data without mutating the page's selected routing identity. */
++export function useWorkspaceCatalog() {
++  const config = getRuntimeWorkspaceConfig()
++  const [workspaces, setWorkspaces] = useState(config?.workspaces || [])
++  const [capabilities, setCapabilities] = useState<WorkspaceCapabilities>({})
++  const [refreshing, setRefreshing] = useState(false)
++  const [stale, setStale] = useState(false)
++  const mounted = useRef(true)
++  const inFlight = useRef<AbortController | null>(null)
++  const enabled = Boolean(config)
++  const hasStartingWorkspace = workspaces.some((row) => row.state === 'starting')
++  const refresh = useCallback(async () => {
++    if (!enabled || !mounted.current || inFlight.current) return
++    const controller = new AbortController()
++    inFlight.current = controller
++    setRefreshing(true)
++    try {
++      const next = await getWorkspaceCatalog(controller.signal)
++      if (mounted.current && !controller.signal.aborted) {
++        setWorkspaces(next.workspaces)
++        setCapabilities(next.capabilities || {})
++        setStale(false)
++      }
++    } catch {
++      if (mounted.current && !controller.signal.aborted) setStale(true)
++    } finally {
++      // An older aborted response cannot clear a newer mount's active request.
++      if (inFlight.current === controller) {
++        inFlight.current = null
++        if (mounted.current) setRefreshing(false)
++      }
++    }
++  }, [enabled])
++  useEffect(() => {
++    mounted.current = true
++    let active = true
++    if (!enabled) return () => { active = false; mounted.current = false }
++    // Guard this effect generation as well as clearing timers: an already
++    // queued callback must not fetch after unmount or a StrictMode remount.
++    const onFocus = () => { if (active) void refresh() }
++    const initial = setTimeout(onFocus, 0)
++    const interval = setInterval(() => { if (active && !document.hidden) void refresh() }, hasStartingWorkspace ? 5000 : 30000)
++    window.addEventListener('focus', onFocus)
++    return () => {
++      active = false
++      mounted.current = false
++      clearTimeout(initial)
++      clearInterval(interval)
++      window.removeEventListener('focus', onFocus)
++      inFlight.current?.abort()
++      inFlight.current = null
++    }
++  }, [enabled, refresh, hasStartingWorkspace])
++  return { workspaces, capabilities, refresh, refreshing, stale }
++}
 diff --git a/lightrag_webui/src/lib/runtimeConfig.ts b/lightrag_webui/src/lib/runtimeConfig.ts
-index 2668b1d..b6dc428 100644
+index 2668b1d..b3ed9f6 100644
 --- a/lightrag_webui/src/lib/runtimeConfig.ts
 +++ b/lightrag_webui/src/lib/runtimeConfig.ts
-@@ -17,10 +17,25 @@
+@@ -17,10 +17,33 @@
   * `constants.ts`); this module returns the raw injected value.
   */
  
@@ -1316,6 +2176,14 @@ index 2668b1d..b6dc428 100644
 +  processing: number
 +  readOnly: boolean
 +  readOnlyReason?: string
++  displayName?: string
++  description?: string
++  tags?: string[]
++  state?: 'stopped' | 'starting' | 'ready' | 'busy' | 'failed'
++  errorCode?: string | null
++  retryable?: boolean
++  retryAfterSeconds?: number | null
++  startupElapsedSeconds?: number | null
 +}
 +
  declare global {
@@ -1329,7 +2197,7 @@ index 2668b1d..b6dc428 100644
        /**
         * Still injected by the server and pinned as part of the published
         * `{apiPrefix, webuiPrefix}` shape (docs/MultiSiteDeployment.md), so
-@@ -50,6 +65,24 @@ export function getRuntimeApiPrefix(): string | undefined {
+@@ -50,6 +73,24 @@ export function getRuntimeApiPrefix(): string | undefined {
    return config.apiPrefix
  }
  
@@ -1399,6 +2267,47 @@ index ad739f9..a178ec6 100644
 -export const LEGACY_SETTINGS_STORAGE_KEY = 'settings-storage'
 +export const LEGACY_SETTINGS_STORAGE_KEY = keys.settings
 +export const SEARCH_HISTORY_STORAGE_KEY = keys.searchHistory
+diff --git a/lightrag_webui/src/lib/workspaceCatalog.ts b/lightrag_webui/src/lib/workspaceCatalog.ts
+new file mode 100644
+index 0000000..a73c7b6
+--- /dev/null
++++ b/lightrag_webui/src/lib/workspaceCatalog.ts
+@@ -0,0 +1,35 @@
++import type { WorkspaceCreation, WorkspaceOperation } from '@/api/workspaces'
++import type { RuntimeWorkspace } from './runtimeConfig'
++
++export const WORKSPACE_FAVORITES_KEY = 'lightrag:workspace-catalog:favorites:v1'
++export const WORKSPACE_CREATION_KEY = 'lightrag:workspace-catalog:pending-creation:v1'
++export interface PendingCreation { key: string; body: WorkspaceCreation; operation?: WorkspaceOperation; rejectionCode?: string }
++
++export function readFavorites(): string[] {
++  try {
++    const saved: unknown = JSON.parse(localStorage.getItem(WORKSPACE_FAVORITES_KEY) || '[]')
++    return Array.isArray(saved) ? saved.filter((id): id is string => typeof id === 'string') : []
++  } catch { return [] }
++}
++export function saveFavorites(ids: string[]): boolean {
++  try { localStorage.setItem(WORKSPACE_FAVORITES_KEY, JSON.stringify(ids)); return true } catch { return false }
++}
++export function readPendingCreation(): PendingCreation | undefined {
++  try {
++    const value = JSON.parse(sessionStorage.getItem(WORKSPACE_CREATION_KEY) || 'null') as PendingCreation | null
++    if (value?.key && value.body?.id && typeof value.body.displayName === 'string' && typeof value.body.description === 'string' && Array.isArray(value.body.tags)) return value
++  } catch { /* Invalid or inaccessible storage must not create a request. */ }
++}
++export function savePendingCreation(value: PendingCreation): boolean {
++  try { sessionStorage.setItem(WORKSPACE_CREATION_KEY, JSON.stringify(value)); return true } catch { return false }
++}
++export function clearPendingCreation() {
++  try { sessionStorage.removeItem(WORKSPACE_CREATION_KEY) } catch { /* Keep usable in private browsing. */ }
++}
++export function filterWorkspaces(workspaces: RuntimeWorkspace[], query: string, favorites: string[], onlyFavorites: boolean): RuntimeWorkspace[] {
++  const terms = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean)
++  return workspaces.filter((row) => {
++    const text = [row.id, row.displayName, row.description, ...(row.tags || [])].join(' ').toLocaleLowerCase()
++    return (!onlyFavorites || favorites.includes(row.id)) && terms.every((term) => text.includes(term))
++  }).sort((a, b) => Number(favorites.includes(b.id)) - Number(favorites.includes(a.id)) || (a.displayName || a.id).localeCompare(b.displayName || b.id))
++}
 diff --git a/lightrag_webui/src/lib/workspaceRouting.test.ts b/lightrag_webui/src/lib/workspaceRouting.test.ts
 new file mode 100644
 index 0000000..2ff36af
@@ -1529,7 +2438,7 @@ index 0000000..e403303
 +  }
 +}
 diff --git a/lightrag_webui/src/locales/en.json b/lightrag_webui/src/locales/en.json
-index ff04a3c..283c481 100644
+index ff04a3c..da29ce5 100644
 --- a/lightrag_webui/src/locales/en.json
 +++ b/lightrag_webui/src/locales/en.json
 @@ -519,6 +519,22 @@
@@ -1555,8 +2464,91 @@ index ff04a3c..283c481 100644
      "welcome": {
        "defaultMarkdown": "Welcome! Ask questions about the knowledge base and get answers with citations. Sign in to get started.",
        "enterButton": "Enter workspace",
+@@ -527,6 +543,82 @@
+     },
+     "queryEmpty": {
+       "defaultMarkdown": "Ask anything about the knowledge base to get started."
++    },
++    "catalog": {
++      "title": "Your workspaces",
++      "description": "Find a collection of documents, or create a separate space for a new topic.",
++      "creation": "Workspace creation",
++      "open": "Open workspace",
++      "done": "Done",
++      "dismiss": "Dismiss",
++      "check": "Check progress",
++      "retryCreation": "Retry same creation",
++      "back": "Back to workspaces",
++      "name": "Name",
++      "id": "Workspace ID",
++      "idHelp": "A permanent address: letters, numbers, dots, underscores and hyphens. Case matters. It cannot be renamed.",
++      "about": "Description",
++      "tags": "Tags",
++      "tagsHint": "Separate tags with commas",
++      "saving": "Saving…",
++      "create": "Create workspace",
++      "save": "Save details",
++      "search": "Search workspaces",
++      "refresh": "Refresh workspaces",
++      "new": "New workspace",
++      "favoritesOnly": "Favorites only",
++      "stale": "Showing the last available list. Refresh to check for changes.",
++      "noResults": "No workspaces match your search.",
++      "favorite": "Favorite {{name}}",
++      "current": "Current",
++      "documents": "{{count}} documents",
++      "edit": "Edit {{name}}",
++      "startAgain": "Try starting again",
++      "failedRetryable": "This workspace could not start. You can try again.",
++      "failedNeedsAttention": "This workspace needs attention before it can open. Contact the server owner.",
++      "storageUnavailable": "Favorites are available for this visit; your browser could not save them.",
++      "metadataSaved": "Workspace details saved. The address and documents are unchanged.",
++      "states": {
++        "stopped": "Sleeping",
++        "starting": "Starting",
++        "ready": "Ready",
++        "busy": "Busy",
++        "failed": "Needs attention"
++      },
++      "operation": {
++        "unknown": "The result is not confirmed. Keep this request and check before creating another space.",
++        "pending": "Creation is queued. You can keep this window open to follow progress.",
++        "running": "Preparing your workspace…",
++        "succeeded": "Workspace created. It is ready to open.",
++        "failed": "Creation did not finish. Existing workspaces and documents are unchanged."
++      },
++      "errors": {
++        "stillWorking": "Creation is taking longer than expected. Check progress again; do not create a second request.",
++        "checkFailed": "Could not check progress. The server may still be working. Check again when the connection returns.",
++        "saveRequestFailed": "Your browser could not save the request identity. Enable session storage before creating a workspace. No request was sent.",
++        "creationRejected": "The server did not accept this creation request. Check the workspace ID, your access and server settings. The original request is kept below.",
++        "creationUncertain": "The connection ended before creation was confirmed. Retry the same creation to recover its result without creating a duplicate.",
++        "metadataFailed": "Could not confirm the saved details. Refresh the list to check before saving again.",
++        "startFailed": "Could not confirm startup. Refresh to check its current state before trying again.",
++        "invalidTags": "Use at most 20 tags, each up to 48 characters."
++      },
++      "reasons": {
++        "timeout": "Opening took longer than expected.",
++        "memory": "The server needs more free memory to open this workspace.",
++        "capacity": "Other workspaces are busy. Please wait before trying again.",
++        "process": "The workspace stopped during startup. Its documents are retained.",
++        "database": "The document database is temporarily unavailable.",
++        "registration": "The workspace registration needs inspection by the server owner.",
++        "schema": "The database needs preparation by the server owner.",
++        "maintenance": "The server is undergoing maintenance. No new work was accepted.",
++        "authentication": "Sign in or provide the configured API key to manage workspaces.",
++        "exists": "That workspace ID is already in use. Choose it from the catalog instead.",
++        "invalidId": "Use a valid, unique workspace ID.",
++        "invalidMetadata": "Check the name, description and tags.",
++        "interrupted": "Creation was interrupted. Retrying the same request can safely continue it."
++      },
++      "retryAfter": "Try again after about {{count}} seconds.",
++      "editRequest": "Edit request"
+     }
+   },
+   "migration": {
 diff --git a/lightrag_webui/src/locales/ru.json b/lightrag_webui/src/locales/ru.json
-index 09aa260..c131b9c 100644
+index 09aa260..684a02d 100644
 --- a/lightrag_webui/src/locales/ru.json
 +++ b/lightrag_webui/src/locales/ru.json
 @@ -519,6 +519,22 @@
@@ -1582,6 +2574,89 @@ index 09aa260..c131b9c 100644
      "welcome": {
        "defaultMarkdown": "Добро пожаловать! Задавайте вопросы по базе знаний и получайте ответы с цитатами. Войдите, чтобы начать.",
        "enterButton": "Войти в рабочее пространство",
+@@ -527,6 +543,82 @@
+     },
+     "queryEmpty": {
+       "defaultMarkdown": "Задайте любой вопрос по базе знаний, чтобы начать."
++    },
++    "catalog": {
++      "title": "Ваши пространства",
++      "description": "Найдите коллекцию документов или создайте отдельное пространство для новой темы.",
++      "creation": "Создание пространства",
++      "open": "Открыть пространство",
++      "done": "Готово",
++      "dismiss": "Закрыть",
++      "check": "Проверить состояние",
++      "retryCreation": "Повторить тот же запрос",
++      "back": "К списку пространств",
++      "name": "Название",
++      "id": "ID пространства",
++      "idHelp": "Постоянный адрес: латинские буквы, цифры, точки, подчёркивания и дефисы. Регистр важен. Изменить его нельзя.",
++      "about": "Описание",
++      "tags": "Теги",
++      "tagsHint": "Разделяйте теги запятыми",
++      "saving": "Сохраняем…",
++      "create": "Создать пространство",
++      "save": "Сохранить описание",
++      "search": "Поиск пространств",
++      "refresh": "Обновить список",
++      "new": "Новое пространство",
++      "favoritesOnly": "Только избранные",
++      "stale": "Показан последний доступный список. Обновите его для проверки изменений.",
++      "noResults": "По вашему запросу ничего не найдено.",
++      "favorite": "В избранное: {{name}}",
++      "current": "Текущее",
++      "documents": "Документов: {{count}}",
++      "edit": "Изменить описание: {{name}}",
++      "startAgain": "Повторить запуск",
++      "failedRetryable": "Пространство не запустилось. Можно повторить попытку.",
++      "failedNeedsAttention": "Перед открытием пространства нужна проверка. Обратитесь к владельцу сервера.",
++      "storageUnavailable": "Избранное доступно до закрытия страницы: браузеру не удалось его сохранить.",
++      "metadataSaved": "Описание сохранено. Адрес и документы не изменились.",
++      "states": {
++        "stopped": "Спит",
++        "starting": "Запускается",
++        "ready": "Готово",
++        "busy": "Занято",
++        "failed": "Нужна проверка"
++      },
++      "operation": {
++        "unknown": "Результат не подтверждён. Сохраните этот запрос и проверьте его перед созданием другого пространства.",
++        "pending": "Создание в очереди. Здесь появится результат.",
++        "running": "Готовим пространство…",
++        "succeeded": "Пространство создано. Его можно открыть.",
++        "failed": "Создание не завершилось. Существующие пространства и документы не изменились."
++      },
++      "errors": {
++        "stillWorking": "Создание занимает больше времени. Проверьте состояние ещё раз; второй запрос создавать не нужно.",
++        "checkFailed": "Не удалось проверить состояние. Сервер может продолжать работу. Повторите проверку после восстановления связи.",
++        "saveRequestFailed": "Браузер не смог сохранить идентификатор запроса. Разрешите хранение данных сеанса. Запрос не отправлен.",
++        "creationRejected": "Сервер не принял запрос создания. Проверьте ID пространства, права доступа и настройки сервера. Исходный запрос сохранён ниже.",
++        "creationUncertain": "Связь оборвалась до подтверждения. Повторите тот же запрос, чтобы узнать результат без создания дубликата.",
++        "metadataFailed": "Не удалось подтвердить сохранение. Обновите список перед повторным сохранением.",
++        "startFailed": "Не удалось подтвердить запуск. Обновите список перед повторной попыткой.",
++        "invalidTags": "Укажите не больше 20 тегов, до 48 символов каждый."
++      },
++      "reasons": {
++        "timeout": "Открытие заняло больше времени, чем ожидалось.",
++        "memory": "Для открытия пространства серверу нужна свободная память.",
++        "capacity": "Другие пространства заняты. Подождите перед повторной попыткой.",
++        "process": "Процесс остановился во время запуска. Документы сохранены.",
++        "database": "База документов временно недоступна.",
++        "registration": "Владельцу сервера нужно проверить регистрацию пространства.",
++        "schema": "Владельцу сервера нужно подготовить базу данных.",
++        "maintenance": "На сервере идут технические работы. Новая работа не принята.",
++        "authentication": "Войдите в систему или укажите настроенный ключ API для управления пространствами.",
++        "exists": "Этот ID уже занят. Выберите пространство из каталога.",
++        "invalidId": "Укажите корректный уникальный ID пространства.",
++        "invalidMetadata": "Проверьте название, описание и теги.",
++        "interrupted": "Создание прервано. Повтор того же запроса позволяет безопасно продолжить его."
++      },
++      "retryAfter": "Повторите примерно через {{count}} сек.",
++      "editRequest": "Изменить запрос"
+     }
+   },
+   "migration": {
 diff --git a/lightrag_webui/src/migrations/importGraph.test.ts b/lightrag_webui/src/migrations/importGraph.test.ts
 index 019b0b4..79bbf2b 100644
 --- a/lightrag_webui/src/migrations/importGraph.test.ts

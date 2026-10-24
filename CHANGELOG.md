@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 — 2026-10-24
+
+- Searchable workspace catalog with display names, descriptions, tags and browser-local favorites in both interfaces. Exact IDs, URL/header routing and existing browser history keys remain unchanged.
+- Explicit idempotent workspace creation, durable operation receipts and crash reconciliation for file and PostgreSQL backends; new vector namespaces are provisioned without changing shared graph tables.
+- Worker lifecycle diagnostics, separate liveness/readiness and authenticated persistent maintenance with request/pipeline draining.
+- Host-run operations toolkit for consistent PostgreSQL/file snapshots, full archive validation, isolated restoration checks, application-only updates/rollback, protected retention and optional checksum-verified second copies.
+- Portable version-preserving ingestion client and cited-source retrieval gates after imports and upgrades.
+- Release workflow for versioned amd64 container images, pre-publication tests and checks of the published immutable digest; source builds remain available.
+
 ## 0.2.3 — 2026-10-24
 
 - PostgreSQL graph workers validate the existing schema on startup instead of repeating schema DDL and legacy edge normalization. A reader holding a graph-table lock no longer causes a cold workspace to fail on the redundant `ALTER TABLE`.

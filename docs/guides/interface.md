@@ -42,3 +42,13 @@ http://localhost:9621/workspaces/research/docs
 ```
 
 The extension scopes Swagger assets and its OpenAPI URL to that workspace. The upstream interface layout is version-specific; a separate “API” tab is not required for the API to be available. Use the served OpenAPI schema for exact request and response fields.
+
+## Search and organize the catalog
+
+Open the catalog next to the selector to search identifiers, display names, descriptions and tags. Favorite frequently used workspaces; favorites remain in this browser. The list refreshes from the server and shows whether a workspace is stopped, starting, ready, busy or failed. A stopped workspace is available to open and is not an error.
+
+Edit a workspace's display name, description or tags without renaming its ID. The scoped URL, database namespace and existing browser conversation/settings keys stay unchanged. The exact ID remains visible for API use.
+
+Use **New workspace** to create an empty corpus. Choose its permanent ID once, then provide optional display metadata. The interface tracks the durable creation operation and reconciles a lost response with the same idempotency key. Failed initialization never presents a half-created corpus as ready. Creating a PostgreSQL workspace requires a previously provisioned database; it does not run a migration or reconfigure existing corpora.
+
+The management controls are capability-driven. When connected to an older gateway without these endpoints, selection remains available and unsupported creation/editing controls are disabled. Authentication remains shared across the installation.

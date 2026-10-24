@@ -92,6 +92,20 @@ jobs:
         run: |
           python3 scripts/smoke_postgres_startup.py --engine docker --image lightrag-workspaces:ci \
             --postgres-image tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
+      - name: Verify explicit creation, crash recovery and unchanged existing corpora
+        run: |
+          docker exec lightrag-postgres-ci createdb -U postgres lightrag_management_ci
+          docker exec lightrag-postgres-ci psql -v ON_ERROR_STOP=1 -U postgres -d lightrag_management_ci \
+            -c 'CREATE EXTENSION vector; CREATE EXTENSION vchord;'
+          docker run --rm --network lightrag-postgres-ci --memory=6g --cpus=2 \
+            -e POSTGRES_HOST=lightrag-postgres-ci -e POSTGRES_PORT=5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=synthetic-ci-only -e POSTGRES_DATABASE=lightrag_management_ci \
+            --mount "type=bind,src=$PWD/scripts,dst=/checks,readonly" \
+            --entrypoint python lightrag-workspaces:ci /checks/smoke_workspace_management.py --target-database lightrag_management_ci
+      - name: Verify exported snapshot restore while new writes continue
+        env:
+          WORKSPACE_OPS_INTEGRATION: '1'
+        run: python3 -m unittest discover -s tests -p test_workspace_ops.py -v
       - name: Remove the owned PostgreSQL fixture
         if: always()
         run: |
