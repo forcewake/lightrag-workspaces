@@ -334,6 +334,25 @@ class OperationTests(unittest.TestCase):
     def test_no_quality_suite_does_not_claim_retrieval_or_require_origin(self):
         self.assertEqual(ops.validate_quality([], None, None), [])
 
+    def test_quality_preflight_preserves_exact_suite_origin_for_checker_guard(self):
+        from types import SimpleNamespace
+        import lightrag_check
+        suite_path = self.root / "suite.json"
+        for suite_origin, configured_origin in (("http://localhost:9621/", "http://localhost:9621"),
+                                                 ("http://localhost:9621", "http://localhost:9621/")):
+            ops.save(suite_path, {"schema_version": 1, "origin": suite_origin, "workspace": "Legacy.V2", "cases": [
+                {"id": "one", "question": "What is the value?", "expected_sources": [{"basename": "source.md", "required_terms": ["42"]}]}]})
+            validated = ops.validate_quality([suite_path], configured_origin, self.root)[0]
+            self.assertEqual(validated["origin"], suite_origin)
+            arguments = SimpleNamespace(suite=suite_path, timeout=300, report=self.root / "new-report.json")
+            # Reaching client construction proves the exact tuple passed the
+            # checker guard. Stop there: this regression sends no requests.
+            with patch.object(lightrag_check, "Client", side_effect=RuntimeError("guard accepted")) as client:
+                with self.assertRaisesRegex(RuntimeError, "guard accepted"):
+                    lightrag_check.run(arguments, expected_suite_sha256=validated["sha256"],
+                                       expected_origin=validated["origin"], expected_workspace=validated["workspace"])
+                client.assert_called_once_with(suite_origin, 300)
+
     def test_drill_removes_auth_passwords_and_uses_dummy_provider_keys(self):
         environment = ops.drill_environment({"AUTH_ACCOUNTS": "admin:real-password", "LLM_BINDING_API_KEY": "real-provider-key",
             "POSTGRES_PASSWORD": "real-db-password", "JWT_SECRET": "real-jwt", "EMBEDDING_MODEL": "model-name",

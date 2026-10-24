@@ -312,7 +312,7 @@ def validate_quality(suites, origin, report_directory):
         suite, checksum = load_suite(path)
         require(suite["origin"].rstrip("/") == expected, "Quality suite targets another origin")
         result.append({"suite": str(Path(path).resolve()), "sha256": checksum,
-                       "origin": expected, "workspace": suite["workspace"], "report_directory": str(directory)})
+                       "origin": suite["origin"], "workspace": suite["workspace"], "report_directory": str(directory)})
     return result
 
 
