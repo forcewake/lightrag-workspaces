@@ -2,7 +2,7 @@ services:
   lightrag:
     build:
       context: .
-    image: lightrag-workspaces:local
+    image: ${LIGHTRAG_IMAGE:-lightrag-workspaces:local}
     restart: unless-stopped
     init: true
     stop_grace_period: 120s

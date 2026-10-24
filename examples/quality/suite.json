@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "origin": "http://127.0.0.1:9621",
+  "workspace": "quality-example",
+  "retrieval": {
+    "mode": "naive",
+    "top_k": 5,
+    "chunk_top_k": 5,
+    "max_total_tokens": 6000,
+    "enable_rerank": false
+  },
+  "cases": [
+    {
+      "id": "ownership",
+      "question": "Who owns the Aurora project and what is its acceptance code?",
+      "expected_sources": [
+        {
+          "basename": "aurora-project-v1.md",
+          "required_terms": [
+            "Owner: Mira Chen",
+            "Acceptance code: AURORA-731"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "capacity-with-qualifier",
+      "question": "What is the planned processing capacity for Aurora, and has it been measured?",
+      "expected_sources": [
+        {
+          "basename": "aurora-project-v1.md",
+          "required_terms": [
+            "240 requests per minute",
+            "planning target, not a measured result"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "russian-status",
+      "question": "Подтверждён ли запуск Aurora и есть ли измерения производительности?",
+      "expected_sources": [
+        {
+          "basename": "aurora-project-v1.md",
+          "required_terms": [
+            "запуск ещё не подтверждён",
+            "измерений производительности нет"
+          ]
+        }
+      ]
+    }
+  ]
+}

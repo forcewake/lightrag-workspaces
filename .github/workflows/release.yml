@@ -1,0 +1,138 @@
+name: Versioned image
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: Existing vMAJOR.MINOR.PATCH tag to build and publish
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.version_tag }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.version_tag || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: '0.9.29'
+      - name: Validate version and immutable source identity
+        id: metadata
+        env:
+          REQUESTED_TAG: ${{ inputs.version_tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, re, subprocess, tomllib
+          tag = os.environ['REQUESTED_TAG']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
+              raise SystemExit('Expected an existing semantic version tag')
+          revision = subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+          tagged = subprocess.check_output(['git','rev-parse',tag+'^{commit}'], text=True).strip()
+          version = tomllib.load(open('pyproject.toml','rb'))['project']['version']
+          if tag != 'v'+version or tagged != revision:
+              raise SystemExit('Tag, project version and checked-out source must agree')
+          image = 'ghcr.io/'+os.environ['GITHUB_REPOSITORY'].lower()
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+              output.write(f'image={image}\nversion={version}\nrevision={revision}\n')
+          PY
+      - name: Run locked tests
+        run: |
+          uv sync --frozen --python 3.12
+          uv run --frozen python -m unittest discover -s tests -v
+          uv run --frozen python -m unittest test_worker -v
+      - name: Build tested amd64 image
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          REVISION: ${{ steps.metadata.outputs.revision }}
+        run: |
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$REVISION" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:sha-$REVISION" .
+          python3 scripts/smoke_container.py --engine docker --image "$IMAGE:$VERSION"
+          python3 scripts/smoke_table_headers.py --engine docker --image "$IMAGE:$VERSION"
+          python3 scripts/smoke_postgres_startup.py --engine docker --image "$IMAGE:$VERSION" \
+            --postgres-image tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
+      - name: Verify snapshot and independent restore under concurrent writes
+        env:
+          WORKSPACE_OPS_INTEGRATION: '1'
+        run: uv run --frozen python -m unittest discover -s tests -p test_workspace_ops.py -v
+      - name: Start isolated native storage and management fixtures
+        run: |
+          docker network create --internal lightrag-release-checks
+          docker run -d --name lightrag-release-postgres --network lightrag-release-checks --memory 2g \
+            -e POSTGRES_PASSWORD=synthetic-release-only \
+            tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
+          for attempt in $(seq 1 60); do
+            if docker exec lightrag-release-postgres pg_isready -U postgres; then break; fi
+            sleep 1
+          done
+          docker exec lightrag-release-postgres pg_isready -U postgres
+          for database in release_native release_management; do
+            docker exec lightrag-release-postgres createdb -U postgres "$database"
+            docker exec lightrag-release-postgres psql -v ON_ERROR_STOP=1 -U postgres -d "$database" \
+              -c 'CREATE EXTENSION vector; CREATE EXTENSION vchord;'
+          done
+      - name: Check actual native stores and management lifecycle before publication
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          docker run --rm --network lightrag-release-checks --memory 4g --cpus 2 \
+            -e POSTGRES_HOST=lightrag-release-postgres -e POSTGRES_PORT=5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=synthetic-release-only -e POSTGRES_DATABASE=release_native \
+            --mount "type=bind,src=$PWD/scripts/smoke_postgres.py,dst=/checks/smoke_postgres.py,readonly" \
+            --entrypoint python "$IMAGE:$VERSION" /checks/smoke_postgres.py --target-database release_native
+          docker run --rm --network lightrag-release-checks --memory 4g --cpus 2 \
+            -e POSTGRES_HOST=lightrag-release-postgres -e POSTGRES_PORT=5432 \
+            -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=synthetic-release-only -e POSTGRES_DATABASE=release_management \
+            --mount "type=bind,src=$PWD/scripts,dst=/checks,readonly" \
+            --entrypoint python "$IMAGE:$VERSION" /checks/smoke_workspace_management.py --target-database release_management
+      - name: Remove owned release fixtures
+        if: always()
+        run: |
+          docker rm -f lightrag-release-postgres || true
+          docker network rm lightrag-release-checks || true
+      - name: Publish the tested image
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          REVISION: ${{ steps.metadata.outputs.revision }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:sha-$REVISION"
+          digest="$(docker image inspect "$IMAGE:$VERSION" --format '{{index .RepoDigests 0}}')"
+          test -n "$digest"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Published amd64 image: `%s`\n\nSource: `%s`\n' "$digest" "$REVISION" >> "$GITHUB_STEP_SUMMARY"
+      - name: Pull and check the registry artifact by immutable digest
+        env:
+          IMAGE: ${{ steps.publish.outputs.digest }}
+        run: |
+          docker pull "$IMAGE"
+          python3 scripts/smoke_container.py --engine docker --image "$IMAGE"
+          python3 scripts/smoke_table_headers.py --engine docker --image "$IMAGE"
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io

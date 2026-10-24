@@ -119,7 +119,10 @@ def smoke(engine: str, image: str, memory: str, startup_timeout: float) -> dict:
               sorted(item["id"] for item in inventory["workspaces"]) == ["default", "research"])
         check("discovery starts no workers", all(not item["loaded"] for item in inventory["workspaces"]))
         before = hashes()
-        check("native fixtures exist before worker startup", len(before) == 14)
+        corpus_files = {name: value for name, value in before.items() if not name.startswith(".workspace-management/")}
+        management_files = {name for name in before if name.startswith(".workspace-management/")}
+        check("native fixtures exist before worker startup", len(corpus_files) == 14)
+        check("gateway adds only its owned control lock before explicit management", management_files == {".workspace-management/gateway.lock"})
         for path in ("/workspaces/research/webui/", "/workspaces/research/workspace/"):
             response = request(path)
             check("workspace configuration: " + path,

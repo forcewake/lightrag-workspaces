@@ -19,6 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from postgres_backend import load_workspace_manifest, selected_backend
+from workspace_management import (CAPABILITIES, WorkspaceManagement, authenticate, body_json, failure, internal_auth_headers)
 
 ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -255,6 +256,8 @@ class Worker:
     log_task: asyncio.Task | None = None
     accepted_requests: bool = False
     startup_memory_bytes: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+    ready_at: float | None = None
 
 
 class WorkerManager:
@@ -270,6 +273,8 @@ class WorkerManager:
             from postgres_inventory import PostgresInventory
             self.postgres_inventory = PostgresInventory()
         self.closing = False
+        self.management = WorkspaceManagement(config)
+        self.failures: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _warning(message: str, *args: Any) -> None:
@@ -372,13 +377,63 @@ class WorkerManager:
                 ))
             worker = self.workers.get(item["id"])
             item["loaded"] = bool(worker and worker.process.returncode is None and worker.ready and worker.ready.done() and not worker.ready.cancelled() and worker.ready.exception() is None)
-        return items
+            item.update(self.worker_status(item))
+        return self.management.decorate(items)
+
+    def worker_status(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        worker = self.workers.get(metadata["id"])
+        result = {"state": "stopped", "startupElapsedSeconds": None,
+                  "errorCode": None, "retryAfterSeconds": None, "retryable": False}
+        if not metadata.get("available", True):
+            transient = metadata.get("errorCode") == "database_unavailable"
+            return {**result, "state": "failed", "errorCode": metadata.get("errorCode", "workspace_registration_invalid"),
+                    "retryable": transient, "retryAfterSeconds": 5 if transient else None}
+        if worker and worker.process.returncode is None:
+            result["startupElapsedSeconds"] = round(max(0, (worker.ready_at or time.monotonic()) - worker.started_at), 1)
+            if worker.ready and not worker.ready.done():
+                result.update(state="starting", retryAfterSeconds=2, retryable=True)
+            elif self._startup_failed(worker):
+                result.update(self.failures.get(metadata["id"], {
+                    "state": "failed", "errorCode": "workspace_start_failed", "retryable": True, "retryAfterSeconds": 5}))
+            else:
+                result["state"] = "busy" if worker.references or metadata.get("pending") or metadata.get("processing") else "ready"
+        elif metadata["id"] in self.failures:
+            result.update(self.failures[metadata["id"]])
+        elif worker and worker.process.returncode is not None:
+            result.update(state="failed", errorCode="workspace_process_exited", retryable=True, retryAfterSeconds=5)
+        return result
+
+    async def maintenance_status(self, token: str | None = None) -> dict[str, Any]:
+        state = self.management.maintenance(token)
+        async with self.lock:
+            workers = list(self.workers.values())
+        idle = await asyncio.gather(*(self._idle(worker) for worker in workers))
+        busy = [worker.workspace_id for worker, is_idle in zip(workers, idle) if not is_idle]
+        active_operations = sum(not task.done() for task in self.management.tasks.values())
+        state.update(activeRequests=sum(worker.references for worker in workers),
+                     activeOperations=active_operations, busyWorkspaces=busy,
+                     drained=not busy and not active_operations)
+        return state
+
+    async def readiness(self, inventory: list[dict[str, Any]]) -> dict[str, Any]:
+        if self.closing:
+            return {"ready": False, "code": "gateway_closing"}
+        if self.management.maintenance()["active"]:
+            return {"ready": False, "code": "maintenance_active"}
+        if self.postgres_inventory is not None and not await self.postgres_inventory.probe(self.config.postgres_database):
+            return {"ready": False, "code": "database_unavailable"}
+        if not any(item["id"] == self.config.default_workspace and item.get("available") for item in inventory):
+            return {"ready": False, "code": "default_workspace_unavailable"}
+        if any(not item.get("available") for item in inventory):
+            return {"ready": False, "code": "workspace_registration_invalid"}
+        return {"ready": True, "code": None, "workspaces": len(inventory)}
 
     async def start(self) -> None:
         if self.config.max_workers < 1:
             raise RuntimeError("At least one workspace process is required")
         if self.config.max_workers > 100:
             raise RuntimeError("The active-workspace limit exceeds the internal port range")
+        self.management.start()
         self.config.runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.config.runtime_root.chmod(0o700)
         self.closing = False
@@ -396,9 +451,7 @@ class WorkerManager:
         if worker.ready is None or worker.ready.cancelled() or worker.ready.exception() is not None:
             return False
         try:
-            internal_headers = {}
-            if os.environ.get("LIGHTRAG_API_KEY"):
-                internal_headers["X-API-Key"] = os.environ["LIGHTRAG_API_KEY"]
+            internal_headers = internal_auth_headers()
             async with httpx.AsyncClient(timeout=3, trust_env=False, headers=internal_headers) as client:
                 response = await client.get(worker.base_url + "/health")
                 health = response.json()
@@ -471,6 +524,7 @@ class WorkerManager:
 
     async def stop(self) -> None:
         self.closing = True
+        await self.management.cancel_operations()
         if self.sweeper:
             self.sweeper.cancel()
             await asyncio.gather(self.sweeper, return_exceptions=True)
@@ -481,30 +535,39 @@ class WorkerManager:
                 self._warning("A workspace did not close cleanly; other shutdowns were still attempted")
         if self.postgres_inventory is not None:
             await self.postgres_inventory.close()
+        await self.management.close()
 
     async def _wait_ready(self, worker: Worker) -> None:
         deadline = time.monotonic() + self.config.startup_timeout
-        async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
+        internal_headers = internal_auth_headers()
+        async with httpx.AsyncClient(timeout=3, trust_env=False, headers=internal_headers) as client:
             while time.monotonic() < deadline:
                 if worker.process.returncode is not None:
-                    raise HTTPException(503, "The selected workspace could not start; its data is retained.")
+                    self.failures[worker.workspace_id] = {"state": "failed", "errorCode": "workspace_start_failed", "retryable": True, "retryAfterSeconds": 5,
+                                                           "startupElapsedSeconds": round(time.monotonic() - worker.started_at, 1)}
+                    raise failure(503, "workspace_start_failed", "The selected workspace could not start; its data is retained.", retryable=True, retry_after=5)
                 try:
                     response = await client.get(worker.base_url + "/health")
                     health = response.json()
                     if (response.status_code == 200 and isinstance(health, dict)
                             and health.get("status") == "healthy"
                             and health.get("selected_workspace_id") == worker.workspace_id):
+                        worker.ready_at = time.monotonic()
+                        self.failures.pop(worker.workspace_id, None)
                         return
                 except (httpx.HTTPError, ValueError, TypeError):
                     pass
                 await asyncio.sleep(0.5)
-        raise HTTPException(503, "The selected workspace is taking longer to open; retry shortly.")
+        self.failures[worker.workspace_id] = {"state": "failed", "errorCode": "workspace_start_timeout", "retryable": True, "retryAfterSeconds": 5,
+                                               "startupElapsedSeconds": round(time.monotonic() - worker.started_at, 1)}
+        raise failure(503, "workspace_start_timeout", "The selected workspace is taking longer to open; retry shortly.", retryable=True, retry_after=5)
 
     @asynccontextmanager
     async def lease(self, workspace_id: str):
         async with self.lock:
+            self.management.assert_available()
             if self.closing:
-                raise HTTPException(503, "Workspace gateway is closing; retry shortly.")
+                raise failure(503, "gateway_closing", "Workspace gateway is closing; retry shortly.", retryable=True, retry_after=5)
             worker = self.workers.get(workspace_id)
             if worker and (worker.process.returncode is not None
                            or (not worker.references and self._startup_failed(worker))):
@@ -532,12 +595,17 @@ class WorkerManager:
                             break
                     else:
                         if not memory_ok:
-                            raise HTTPException(503, "The selected workspace needs more free memory. "
-                                                "Finish current work and retry; saved data has not changed.")
-                        raise HTTPException(503, "All workspace slots are busy. Retry when a running request finishes.")
+                            raise failure(503, "workspace_memory_unavailable", "The selected workspace needs more free memory; no request was accepted.", retryable=True, retry_after=5)
+                        raise failure(503, "workspace_capacity_busy", "All workspace slots are busy; no request was accepted.", retryable=True, retry_after=5)
                 used = {item.port for item in self.workers.values()}
                 port = next(value for value in range(19621, 19721) if value not in used)
-                worker = await self._spawn(workspace_id, port)
+                try:
+                    worker = await self._spawn(workspace_id, port)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.failures[workspace_id] = {"state": "failed", "errorCode": "workspace_spawn_failed", "retryable": True, "retryAfterSeconds": 5}
+                    raise failure(503, "workspace_spawn_failed", "The workspace process could not be started; no request was accepted.", retryable=True, retry_after=5) from None
                 worker.startup_memory_bytes = memory_needed
                 self.workers[workspace_id] = worker
             worker.references += 1
@@ -574,16 +642,62 @@ def create_app(config: Config, manager: Any = None, transport: Any = None) -> Fa
     application = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     application.state.manager = manager
 
+    @application.exception_handler(HTTPException)
+    async def gateway_error(request: Request, error: HTTPException):
+        if isinstance(error.detail, dict) and "code" in error.detail:
+            return JSONResponse({"detail": error.detail.get("message", "Workspace operation failed."),
+                                 "code": error.detail["code"], "retryable": error.detail.get("retryable", False)},
+                                status_code=error.status_code, headers=error.headers)
+        return JSONResponse({"detail": error.detail}, status_code=error.status_code, headers=error.headers)
+
     @application.api_route("/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def route(request: Request, path: str):
         if "\\" in request.url.path or any(part in (".", "..") for part in request.url.path.split("/")):
             raise HTTPException(400, "Invalid path")
+        management = getattr(manager, "management", None)
+        if request.url.path == "/livez" and request.method in ("GET", "HEAD"):
+            return JSONResponse({"alive": not getattr(manager, "closing", False)},
+                                status_code=503 if getattr(manager, "closing", False) else 200,
+                                headers={"Cache-Control": "no-store"})
+        if request.url.path in ("/maintenance", "/maintenance/release"):
+            authenticate(request)
+            if management is None:
+                raise failure(503, "management_unavailable", "Workspace management is unavailable.")
+            token = request.headers.get("X-Maintenance-Token")
+            if request.method == "POST":
+                body = await body_json(request)
+                await management.set_maintenance(body, release=request.url.path.endswith("/release"))
+                token = body["ownerToken"]
+            elif request.method != "GET" or request.url.path.endswith("/release"):
+                raise HTTPException(405, "Use GET or POST for maintenance")
+            return JSONResponse(await manager.maintenance_status(token), headers={"Cache-Control": "no-store"})
+        if request.url.path.startswith("/workspace-operations/"):
+            authenticate(request)
+            if request.method != "GET":
+                raise HTTPException(405, "Operation receipts are read-only")
+            if management is None:
+                raise failure(503, "management_unavailable", "Workspace management is unavailable.")
+            return JSONResponse(management.operation(request.url.path[len("/workspace-operations/"):]), headers={"Cache-Control": "no-store"})
+        if request.url.path.rstrip("/") == "/workspaces" and request.method == "POST":
+            authenticate(request)
+            if management is None:
+                raise failure(503, "management_unavailable", "Workspace management is unavailable.")
+            keys = request.headers.getlist("Idempotency-Key")
+            if len(keys) != 1:
+                raise failure(422, "idempotency_key_required", "Supply one Idempotency-Key.")
+            operation = await management.create(await body_json(request), keys[0])
+            return JSONResponse(operation, status_code=200 if operation["state"] == "succeeded" else 202,
+                                headers={"Cache-Control": "no-store", "Location": "/workspace-operations/" + operation["id"]})
         inventory = await manager.inventory()
         registry = {item["id"]: item for item in inventory}
+        if request.url.path == "/readyz" and request.method in ("GET", "HEAD"):
+            result = await manager.readiness(inventory)
+            return JSONResponse(result, status_code=200 if result["ready"] else 503, headers={"Cache-Control": "no-store"})
         if request.url.path in ("/workspaces", "/workspaces/"):
             if request.method not in ("GET", "HEAD"):
-                raise HTTPException(405, "Workspace discovery is read-only")
-            return JSONResponse({"defaultWorkspace": config.default_workspace, "workspaces": inventory}, headers={"Cache-Control": "no-store"})
+                raise HTTPException(405, "Use GET for discovery or POST for explicit creation")
+            return JSONResponse({"defaultWorkspace": config.default_workspace, "workspaces": inventory,
+                                 "capabilities": CAPABILITIES if management else {}}, headers={"Cache-Control": "no-store"})
 
         values = [value.decode("latin1") for key, value in request.scope["headers"] if key.lower() == b"lightrag-workspace"]
         if len(values) > 1 or (values and (not values[0] or values[0] != values[0].strip() or not ID_PATTERN.fullmatch(values[0]))):
@@ -606,6 +720,24 @@ def create_app(config: Config, manager: Any = None, transport: Any = None) -> Fa
         prefix = "/workspaces/" + selected
         identity_headers = {"LIGHTRAG-WORKSPACE": selected, "X-LightRAG-Workspace": selected}
 
+        if path_id and upstream_path in ("/status", "/metadata", "/prewarm"):
+            authenticate(request)
+            if upstream_path == "/status" and request.method == "GET":
+                return JSONResponse(metadata, headers={**identity_headers, "Cache-Control": "no-store"})
+            if management is None:
+                raise failure(503, "management_unavailable", "Workspace management is unavailable.")
+            if upstream_path == "/metadata" and request.method == "PATCH":
+                updated = await management.update_metadata(selected, await body_json(request))
+                return JSONResponse(updated, headers={**identity_headers, "Cache-Control": "no-store"})
+            if upstream_path == "/prewarm" and request.method == "POST":
+                if not metadata.get("available", True):
+                    raise failure(409, "workspace_registration_invalid", "Workspace registration needs inspection.")
+                async with manager.lease(selected):
+                    pass
+                current = next(item for item in await manager.inventory() if item["id"] == selected)
+                return JSONResponse(current, headers={**identity_headers, "Cache-Control": "no-store"})
+            raise HTTPException(405, "Unsupported management method")
+
         if upstream_path == "/":
             return RedirectResponse(prefix + "/webui/", status_code=307, headers=identity_headers)
         if upstream_path in ("/webui", "/workspace"):
@@ -623,7 +755,7 @@ def create_app(config: Config, manager: Any = None, transport: Any = None) -> Fa
                 runtime = {"apiPrefix": prefix, "workspaceId": selected,
                            "defaultWorkspace": config.default_workspace,
                            "legacyStorageWorkspace": config.legacy_storage_workspace or config.default_workspace,
-                           "workspaces": inventory}
+                           "workspaces": inventory, "capabilities": CAPABILITIES if management else {}}
                 script = "<script>window.__LIGHTRAG_CONFIG__=" + json.dumps(runtime).replace("<", "\\u003c") + ";</script>"
                 html = html.replace("<head>", "<head>" + script, 1)
                 return Response(html, media_type="text/html", headers={**identity_headers, "Cache-Control": "no-store"})
@@ -633,8 +765,14 @@ def create_app(config: Config, manager: Any = None, transport: Any = None) -> Fa
                 raise HTTPException(404, "UI asset not found")
             return FileResponse(file_path, headers=identity_headers)
 
+        if management is not None:
+            management.assert_available()
         if not metadata.get("available", True):
-            raise HTTPException(409, metadata.get("readOnlyReason") or "Workspace metadata needs inspection")
+            raise failure(503 if metadata.get("errorCode") == "database_unavailable" else 409,
+                          metadata.get("errorCode", "workspace_registration_invalid"),
+                          metadata.get("readOnlyReason") or "Workspace metadata needs inspection",
+                          retryable=metadata.get("errorCode") == "database_unavailable",
+                          retry_after=5 if metadata.get("errorCode") == "database_unavailable" else None)
         if metadata.get("readOnly") and request.method not in ("GET", "HEAD", "OPTIONS") and not (request.method == "POST" and upstream_path.rstrip("/") in READ_POSTS):
             return JSONResponse({"detail": metadata.get("readOnlyReason"), "workspace": selected, "code": "legacy_queue_preserved"}, status_code=409, headers=identity_headers)
 

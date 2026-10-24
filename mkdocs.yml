@@ -61,6 +61,7 @@ nav:
       - Browser interface: guides/interface.md
       - API and streaming: guides/api.md
       - File processing: guides/file-processing.md
+      - Ingestion and quality gates: guides/quality.md
   - Bring existing data:
       - Adopt an installation: guides/existing-data.md
       - PostgreSQL + VectorChord: guides/postgresql.md
@@ -68,6 +69,7 @@ nav:
       - Unraid: guides/unraid.md
       - Backup and rollback: guides/backup-and-rollback.md
   - Operate:
+      - Backup, restore and updates: guides/operations.md
       - Configuration: reference/configuration.md
       - Architecture and limits: reference/architecture.md
       - Troubleshooting: reference/troubleshooting.md

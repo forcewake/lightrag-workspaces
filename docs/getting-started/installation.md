@@ -76,3 +76,7 @@ data/
 ```
 
 Back up `rag_storage`, `inputs`, your private `.env`, Compose overrides, and the source revision together. Keep runtime outside the corpus tree. See [backup and rollback](../guides/backup-and-rollback.md).
+
+## Use a published image
+
+The release workflow can publish versioned linux/amd64 images. When a release provides a verified image digest, set `LIGHTRAG_IMAGE=ghcr.io/forcewake/lightrag-workspaces@sha256:VERIFIED_DIGEST` in your private `.env`, then use `docker compose pull` and `docker compose up -d --no-build`. For a fresh file-mode install, run the same explicit initializer before starting the service. Source builds above remain available if a registry image has not been published. Changing the image on an existing installation still requires the [backup and update procedure](../guides/operations.md); a pull does not preserve or verify data by itself.

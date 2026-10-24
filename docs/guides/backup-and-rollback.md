@@ -55,3 +55,7 @@ The importer does not export new PostgreSQL changes back to JSON. Returning to t
 ## Upgrade safely
 
 Pin the extension revision and keep the previous image. Build the next version separately, read its compatibility notes, and exercise a copy of representative corpora before cutover. Changing the upstream image or UI commit requires a source and preservation review; removing a pin is not an upgrade procedure.
+
+## Reusable PostgreSQL operations
+
+For 0.3 and later, use the [operations tool](operations.md) for a coordinated database/file snapshot with a short measured write pause, protected retention, isolated restore drills and application-only updates. The cold-copy procedure remains the bootstrap path for older versions that do not have the maintenance API. Creation receipts and catalog metadata under the control root belong in the backup alongside workspace manifests.

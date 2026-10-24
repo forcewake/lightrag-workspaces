@@ -8,6 +8,7 @@ Copy `.env.example` to `.env` and keep it private. Compose reads host options fr
 | --- | --- | --- |
 | `BIND_ADDRESS` | `127.0.0.1` | Compose host bind address; use network controls before changing it |
 | `LIGHTRAG_PORT` | `9621` | Published host port; the gateway listens on container port 9621 |
+| `LIGHTRAG_IMAGE` | `lightrag-workspaces:local` | Compose image name; optionally pin a verified registry digest |
 | `LIGHTRAG_MEMORY_LIMIT` | `8g` | Compose container hard memory ceiling; size for your corpora |
 | `LIGHTRAG_STORAGE_BACKEND` | `file` | `file` or `postgres`; use the explicit migration procedure before changing |
 | `LIGHTRAG_DEFAULT_WORKSPACE` | `default` | Existing corpus used when no selector is supplied |
@@ -103,7 +104,7 @@ The worker validates the registered database, exact workspace mapping, embedding
 | `POSTGRES_VCHORDRQ_PROBES` | Optional probe override; leave empty unless it matches your index partition hierarchy |
 | `POSTGRES_VCHORDRQ_BUILD_OPTIONS` | Optional VectorChord index options; leave empty for the initial unpartitioned setup |
 
-The gateway has an additional read-only metadata pool capped at two connections. It checks the target database identity and reads live document counts; discovery never creates tables or loads original JSON. The control root contains a `.postgres-workspace.json` registration under each exact public workspace ID. The offline importer publishes this file only after verification. Do not edit registrations or copy them between unrelated databases.
+The gateway has an additional read-only metadata pool capped at two connections. It checks the target database identity and reads live document counts; discovery never creates tables or loads original JSON. The control root contains a `.postgres-workspace.json` registration under each exact public workspace ID. The offline importer or explicit empty-workspace creation operation publishes this file only after verification. Do not edit registrations or copy them between unrelated databases.
 
 See [PostgreSQL migration](../guides/postgresql.md) for extension installation, connection networking, an explicit import, and backup requirements. A configuration change alone does not migrate a corpus.
 
@@ -132,3 +133,7 @@ docker compose up -d --force-recreate
 ```
 
 Finish or stop active ingestion before recreation. Changing providers, embeddings, or parser settings can affect newly written data; a container restart does not migrate existing indexes. Back up before changes that alter the data contract.
+
+## Catalog and maintenance state
+
+The backed-up control root contains `.workspace-management/`: catalog metadata, durable creation receipts and a persistent maintenance owner hash. Startup adds this directory; existing workspace registrations and corpus files retain their identities. A gateway holds an exclusive control-root lock until its workers stop. Never share that root between live gateways. Favorites remain browser-local and are not part of server backups.

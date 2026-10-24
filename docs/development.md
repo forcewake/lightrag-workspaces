@@ -1,6 +1,6 @@
 # Develop the extension
 
-The repository contains a small Python gateway and worker layer, an upstream frontend patch, and a source-only Docker build. Do not edit generated UI bundles as the source of a change.
+The repository contains a small Python gateway and worker layer, an upstream frontend patch, and a reproducible Docker source build and versioned image workflow. Do not edit generated UI bundles as the source of a change.
 
 ## Python checks
 
@@ -97,3 +97,15 @@ For runtime integration, use an independent temporary storage/input/runtime tree
 For preservation changes, compare a baseline copy before reads, after worker loading, and after clean shutdown. Separate startup-only checks from later explicit writes. Include empty directories and old pending/processing states. Never use a production corpus as a write probe.
 
 Contribution expectations, issue templates, and pull-request guidance are in the repository's `CONTRIBUTING.md`. An upstream upgrade requires the [release checklist](releasing.md).
+
+## Workspace management and operations integration
+
+`smoke_workspace_management.py` requires a **new disposable database** with vector/vchord installed. It exercises real PostgreSQL creation under shared graph reader locks, crash reconciliation, exact punctuation/case IDs, native writes in the new namespace, metadata, maintenance and gateway restart. It rejects a pre-existing database through the migration ownership guard. CI runs it separately from the existing migration fixture.
+
+```sh
+WORKSPACE_OPS_INTEGRATION=1 python3 -m unittest discover -s tests -p test_workspace_ops.py -v
+```
+
+This opt-in test creates two owned, network-isolated PostgreSQL containers. It freezes an exported snapshot, modifies the live synthetic fixture, proves dump/fingerprints still match the frozen view, restores into the second instance, and rejects a truncated archive. The ordinary Python job reports this integration as skipped; the Docker CI and release jobs explicitly enable it. No skipped check is counted as live runtime proof.
+
+The [quality tools](guides/quality.md) use the standard library and synthetic localhost services in unit tests. Keep real suites and reports outside the repository.
