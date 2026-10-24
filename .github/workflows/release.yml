@@ -83,10 +83,10 @@ jobs:
             -e POSTGRES_PASSWORD=synthetic-release-only \
             tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
           for attempt in $(seq 1 60); do
-            if docker exec lightrag-release-postgres pg_isready -U postgres; then break; fi
+            if docker exec lightrag-release-postgres pg_isready -h 127.0.0.1 -U postgres; then break; fi
             sleep 1
           done
-          docker exec lightrag-release-postgres pg_isready -U postgres
+          docker exec lightrag-release-postgres pg_isready -h 127.0.0.1 -U postgres
           for database in release_native release_management; do
             docker exec lightrag-release-postgres createdb -U postgres "$database"
             docker exec lightrag-release-postgres psql -v ON_ERROR_STOP=1 -U postgres -d "$database" \
