@@ -69,6 +69,7 @@ jobs:
             -t "$IMAGE:$VERSION" -t "$IMAGE:sha-$REVISION" .
           python3 scripts/smoke_container.py --engine docker --image "$IMAGE:$VERSION"
           python3 scripts/smoke_table_headers.py --engine docker --image "$IMAGE:$VERSION"
+          docker pull tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
           python3 scripts/smoke_postgres_startup.py --engine docker --image "$IMAGE:$VERSION" \
             --postgres-image tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
       - name: Verify snapshot and independent restore under concurrent writes
