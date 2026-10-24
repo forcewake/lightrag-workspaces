@@ -35,6 +35,7 @@ from postgres_backend import (
     validate_postgres_readiness,
 )
 from table_headers import install_table_header_preservation
+from postgres_startup import install_postgres_graph_startup
 
 
 WORKSPACE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
@@ -501,6 +502,7 @@ def run_worker(args: argparse.Namespace) -> None:
             install_bounded_nano_loader()
         else:
             install_postgres_vector_namespace()
+            install_postgres_graph_startup(manifest)
 
         from lightrag.api import lightrag_server as server
         from lightrag.api.config import global_args, update_uvicorn_mode_config
