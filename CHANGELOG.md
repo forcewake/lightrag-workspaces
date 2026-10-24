@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 — 2026-10-24
+
+- Backup verification sorts fixed-size SHA-256 row digests instead of complete document/vector rows, reducing PostgreSQL temporary-file use without changing server limits. Counts and duplicate rows remain part of verification.
+- New fingerprints pin timestamp, date, interval and bytea serialization settings. Restore drills select the recorded algorithm and retain support for existing v1 backup bundles.
+- Release fixtures explicitly pull the pinned PostgreSQL image and wait for the final TCP listener before running checks.
+
 ## 0.3.0 — 2026-10-24
 
 - Searchable workspace catalog with display names, descriptions, tags and browser-local favorites in both interfaces. Exact IDs, URL/header routing and existing browser history keys remain unchanged.

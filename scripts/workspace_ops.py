@@ -34,6 +34,10 @@ NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}\Z")
 DATABASE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{0,62}\Z")
 SNAPSHOT = re.compile(r"[0-9A-F]+-[0-9A-F]+-[0-9]+\Z", re.I)
 WORKSPACE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+FINGERPRINT_V1 = "sorted-jsonb-copy-sha256-v1"
+FINGERPRINT_V2 = "sorted-jsonb-row-sha256-v2"
+FINGERPRINT_ALGORITHMS = {FINGERPRINT_V1, FINGERPRINT_V2}
+ROW_DIGEST = re.compile(rb"[0-9a-f]{64}\Z")
 
 
 def require(value, message):
@@ -58,7 +62,7 @@ def compare_restored_fingerprint(source, restored):
     expected, actual = copy.deepcopy(source), copy.deepcopy(restored)
     for value in (expected, actual):
         checksum = value.pop("sha256", None)
-        require(value.get("algorithm") == "sorted-jsonb-copy-sha256-v1" and checksum == digest(value),
+        require(value.get("algorithm") in FINGERPRINT_ALGORITHMS and checksum == digest(value),
                 "Invalid database fingerprint receipt")
     actual_indexes = actual["schema"].get("indexes") or []
     identities = {(index["tablename"], index["indexname"]) for index in actual_indexes}
@@ -82,7 +86,7 @@ def compare_restored_service_fingerprint(before, after, omitted_invalid_indexes)
     expected, actual = copy.deepcopy(before), copy.deepcopy(after)
     for value in (expected, actual):
         checksum = value.pop("sha256", None)
-        require(value.get("algorithm") == "sorted-jsonb-copy-sha256-v1" and checksum == digest(value),
+        require(value.get("algorithm") in FINGERPRINT_ALGORITHMS and checksum == digest(value),
                 "Invalid database fingerprint receipt")
     identities = {(index["tablename"], index["indexname"]) for index in expected["schema"].get("indexes") or []}
     permitted = {(index["tablename"], index["indexname"]): index for index in omitted_invalid_indexes
@@ -160,8 +164,9 @@ def run(arguments, *, data=None, output=None, timeout=3600):
     return result.stdout
 
 
-def hash_command(arguments, data, timeout=3600):
-    """Bound memory while hashing all sorted PostgreSQL row bytes."""
+def hash_command(arguments, data, timeout=3600, *, expected_rows=None):
+    """Stream hashes; v2 also verifies every fixed-width digest and row count."""
+    require(expected_rows is None or (type(expected_rows) is int and expected_rows >= 0), "Invalid expected row count")
     with tempfile.TemporaryFile() as errors:
         process = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
         expired = threading.Event()
@@ -176,9 +181,18 @@ def hash_command(arguments, data, timeout=3600):
             process.stdin.write(data)
             process.stdin.close()
             value = hashlib.sha256()
+            pending, rows = b"", 0
             for block in iter(lambda: process.stdout.read(1024 * 1024), b""):
                 value.update(block)
+                if expected_rows is not None:
+                    lines = (pending + block).split(b"\n")
+                    pending = lines.pop()
+                    require(len(pending) <= 64 and all(ROW_DIGEST.fullmatch(line) for line in lines),
+                            "Invalid database row digest framing")
+                    rows += len(lines)
             require(process.wait() == 0 and not expired.is_set(), "Database fingerprint failed/timed out")
+            require(expected_rows is None or (not pending and rows == expected_rows),
+                    "Database fingerprint row count/framing differs")
             return value.hexdigest()
         finally:
             timer.cancel()
@@ -566,14 +580,19 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
                 process.stdin.close()
                 process.stdout.close()
 
-    def transaction(self, snapshot=None):
+    def transaction(self, snapshot=None, *, algorithm=FINGERPRINT_V2):
         require(snapshot is None or SNAPSHOT.fullmatch(snapshot), "Invalid exported snapshot")
-        return "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;" + (
+        require(algorithm in FINGERPRINT_ALGORITHMS, "Unsupported database fingerprint algorithm")
+        prefix = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;" + (
             "SET TRANSACTION SNAPSHOT '" + snapshot + "';" if snapshot else "") + (
             "SET LOCAL statement_timeout='30min';SET LOCAL extra_float_digits=3;")
+        if algorithm == FINGERPRINT_V2:
+            prefix += ("SET LOCAL TimeZone='UTC';SET LOCAL DateStyle='ISO,YMD';"
+                       "SET LOCAL IntervalStyle='postgres';SET LOCAL bytea_output='hex';")
+        return prefix
 
-    def fingerprint(self, snapshot=None, *, container=None, user=None):
-        prefix = self.transaction(snapshot)
+    def fingerprint(self, snapshot=None, *, container=None, user=None, algorithm=FINGERPRINT_V2):
+        prefix = self.transaction(snapshot, algorithm=algorithm)
         query = """SELECT json_build_object(
           'tables',(SELECT json_agg(tablename ORDER BY tablename) FROM pg_tables WHERE schemaname='public'),
           'columns',(SELECT json_agg(row_to_json(c) ORDER BY table_name,ordinal_position) FROM
@@ -597,11 +616,19 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
             identifier = 'public."' + table.replace('"', '""') + '"'
             count = int(self.sql(prefix + "SELECT count(*) FROM " + identifier + ";COMMIT;",
                                  container=container, user=user))
-            query = prefix + "COPY (SELECT to_jsonb(t)::text AS row FROM " + identifier + (
-                " t ORDER BY to_jsonb(t)::text COLLATE \"C\") TO STDOUT;COMMIT;")
-            checksum = hash_command(self.psql_args(container=container, user=user), query.encode())
+            if algorithm == FINGERPRINT_V1:
+                query = prefix + "COPY (SELECT to_jsonb(t)::text AS row FROM " + identifier + (
+                    " t ORDER BY to_jsonb(t)::text COLLATE \"C\") TO STDOUT;COMMIT;")
+            else:
+                # Materialize only a fixed-width digest at the sort node. Wide
+                # document/vector JSONB rows must never enter its temp files.
+                expression = "pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(to_jsonb(t)::text,'UTF8')),'hex')"
+                query = prefix + "COPY (SELECT " + expression + " COLLATE \"C\" AS row_digest FROM " + identifier + (
+                    " t ORDER BY row_digest) TO STDOUT;COMMIT;")
+            checksum = hash_command(self.psql_args(container=container, user=user), query.encode(),
+                                    expected_rows=count if algorithm == FINGERPRINT_V2 else None)
             rows.append({"table": table, "count": count, "sha256": checksum})
-        value = {"algorithm": "sorted-jsonb-copy-sha256-v1", "schema": schema, "tables": rows}
+        value = {"algorithm": algorithm, "schema": schema, "tables": rows}
         return value | {"sha256": digest(value)}
 
     def plan(self):
@@ -771,6 +798,12 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
     def restore_drill(self, bundle, *, keep=False):
         bundle = Path(bundle)
         proof = self.verify_bundle(bundle)
+        source_fingerprint = load(bundle / "database-fingerprint.json")
+        algorithm = source_fingerprint.get("algorithm")
+        require(algorithm in FINGERPRINT_ALGORITHMS, "Unsupported database fingerprint algorithm")
+        fingerprint_payload = {key: value for key, value in source_fingerprint.items() if key != "sha256"}
+        require(source_fingerprint.get("sha256") == digest(fingerprint_payload) == proof.get("database_sha256"),
+                "Invalid database fingerprint receipt or backup binding")
         directory, record = self.operation("drill")
         self.stage(directory, record, "preparing", backup_id=proof["id"], backup_bundle=str(bundle))
         pg = load(bundle / "postgres.json")
@@ -818,8 +851,8 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
                                          "--no-owner", "--no-privileges", "-U", "postgres", "-d", self.database],
                                         stdin=stream, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=7200)
             require(result.returncode == 0, "Independent database restore failed; owned fixture retained")
-            restored = self.fingerprint(container=dbname, user="postgres")
-            comparison = compare_restored_fingerprint(load(bundle / "database-fingerprint.json"), restored)
+            restored = self.fingerprint(container=dbname, user="postgres", algorithm=algorithm)
+            comparison = compare_restored_fingerprint(source_fingerprint, restored)
             save(directory / "restored-fingerprint.json", restored)
             save(directory / "restore-comparison.json", comparison)
             self.stage(directory, record, "database-verified", database_sha256=restored["sha256"])
@@ -868,7 +901,7 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
                     "Restored workspace inventory differs")
             service = self.scoped_checks(appname)
             save(directory / "service-proof.json", service)
-            after_service = self.fingerprint(container=dbname, user="postgres")
+            after_service = self.fingerprint(container=dbname, user="postgres", algorithm=algorithm)
             service_comparison = compare_restored_service_fingerprint(
                 restored, after_service, comparison["omitted_invalid_source_indexes"])
             save(directory / "after-service-fingerprint.json", after_service)
