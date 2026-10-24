@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 — 2026-10-25
+
+- The workspace selector now searches names, IDs and tags directly in its dropdown. Current and favorite workspaces are easy to find, with document counts, bounded scrolling and keyboard navigation in both interfaces.
+- Workspace IDs, scoped URLs, API selection and browser histories remain unchanged. The separate catalog still handles creation and metadata editing.
+- Application update checks compare complete Docker mount records independently of their returned order, while rejecting changed fields and duplicate destinations.
+
 ## 0.3.1 — 2026-10-24
 
 - Backup verification sorts fixed-size SHA-256 row digests instead of complete document/vector rows, reducing PostgreSQL temporary-file use without changing server limits. Counts and duplicate rows remain part of verification.

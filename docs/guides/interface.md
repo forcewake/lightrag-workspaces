@@ -12,6 +12,14 @@ Choose a workspace before uploading files or asking a question. Its identifier a
 
 Unscoped UI URLs redirect to the default workspace. The selector is available in both interfaces. Selecting a different workspace reloads the page under its scoped URL; it does not mutate a server-wide “current workspace.” Two tabs can therefore work with different corpora at the same time.
 
+## Find a workspace in the selector
+
+Open the workspace control in the header and start typing. Search matches display names, identifiers and tags without changing the selected workspace. With no search, the current workspace and browser favorites appear first; the remaining list scrolls within the dropdown. Counts help distinguish corpora, and a custom display name keeps its exact ID visible.
+
+Use **Arrow Up/Down** to move through results, **Home/End** to reach the first or last result, and **Enter** to open the highlighted workspace. **Escape** closes the dropdown and returns focus to the workspace control. Clear an unmatched search to show the list again. Read-only corpora remain selectable for search.
+
+The catalog button beside the selector opens **Your workspaces** for favoriting, creation and metadata editing. Those controls continue to use the same exact workspace IDs.
+
 ## What follows the selection
 
 - Documents, graph requests, queries, and uploads target the selected worker.

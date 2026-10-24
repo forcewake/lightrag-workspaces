@@ -138,6 +138,79 @@ class OperationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "host settings"):
             ops.validate_retained(original, retained)
 
+    def test_mount_order_is_irrelevant_but_every_field_remains_authoritative(self):
+        mounts = [
+            {"Type": "bind", "Source": "/inputs", "Destination": "/app/inputs", "RW": True,
+             "Mode": "rw", "Propagation": "rprivate", "driver_specific": {"option": "kept"}},
+            {"Type": "bind", "Source": "/control", "Destination": "/app/control", "RW": True},
+        ]
+        before = copy.deepcopy(mounts)
+        self.assertEqual(ops.canonical_mounts(mounts), ops.canonical_mounts(list(reversed(mounts))))
+        self.assertEqual(mounts, before, "Inspection order and nested fields must not be mutated")
+        for field, changed in (("Source", "/elsewhere"), ("RW", False), ("Type", "volume"),
+                               ("Mode", "ro"), ("Propagation", "rshared"),
+                               ("Destination", "/app/other"), ("driver_specific", {"option": "changed"})):
+            candidate = copy.deepcopy(mounts)
+            candidate[0][field] = changed
+            with self.subTest(field=field):
+                self.assertNotEqual(ops.canonical_mounts(mounts), ops.canonical_mounts(candidate))
+
+    def test_malformed_and_duplicate_mount_destinations_fail_closed(self):
+        malformed = (None, {}, [None], [{}], [{"Destination": None}], [{"Destination": 123}],
+                     [{"Destination": "relative"}], [{"Destination": "/app/../data"}],
+                     [{"Destination": "//app/data"}], [{"Destination": "/app/\0data"}],
+                     [{"Destination": "/same", "Source": "/one"},
+                      {"Destination": "/same", "Source": "/two"}])
+        for mounts in malformed:
+            with self.subTest(mounts=mounts), self.assertRaisesRegex(RuntimeError, "mount"):
+                ops.canonical_mounts(mounts)
+        duplicate = self.container()
+        duplicate["Mounts"].append(copy.deepcopy(duplicate["Mounts"][0]))
+        with self.assertRaisesRegex(RuntimeError, "Duplicate"):
+            ops.image_config(duplicate, {"Config": {}}, image="sha256:new")
+        with self.assertRaisesRegex(RuntimeError, "Duplicate"):
+            self.operations.mount_sources(duplicate)
+
+    def test_retained_container_accepts_reordered_mounts_but_rejects_source_drift(self):
+        original = self.container()
+        original["Mounts"].append({"Type": "bind", "Source": "/inputs", "Destination": "/app/inputs", "RW": True})
+        retained = copy.deepcopy(original)
+        retained["Mounts"].reverse()
+        retained["HostConfig"]["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
+        ops.validate_retained(original, retained)
+        retained["Mounts"][0]["Source"] = "/different-inputs"
+        with self.assertRaisesRegex(RuntimeError, "configuration/mounts"):
+            ops.validate_retained(original, retained)
+
+    def test_update_plan_reuses_backup_with_reordered_mounts_and_rejects_changed_mount(self):
+        original = self.container()
+        original["Mounts"].append({"Type": "bind", "Source": "/inputs", "Destination": "/app/inputs", "RW": True})
+        current = copy.deepcopy(original)
+        current["Mounts"].reverse()
+        image = {"Id": "sha256:new", "Config": {"Entrypoint": ["python"], "Cmd": ["new"]}}
+        self.operations.config.update(expected_application_id=original["Id"], expected_postgres_id="b" * 64)
+        ops.save(self.root / "application.json", original)
+        acceptance = self.root / "acceptance.json"
+        ops.save(acceptance, {"passed": True, "image_id": image["Id"],
+                              "database_compatible": True, "application_only": True})
+
+        def inspect(name, **kwargs):
+            return {self.operations.app: current, self.operations.pg: {"Id": "b" * 64},
+                    "candidate": image, original["Image"]: {"Config": original["Config"]}}[name]
+
+        with patch.object(self.operations, "verify_bundle", return_value={"id": "backup"}), \
+                patch.object(self.operations, "inspect", side_effect=inspect), \
+                patch.object(self.operations, "operation") as operation, \
+                patch.object(self.operations, "docker") as docker:
+            result = self.operations.update(self.root, "candidate", acceptance)
+            self.assertFalse(result["apply"])
+            self.assertEqual(result["candidate_image"], image["Id"])
+            current["Mounts"][0]["RW"] = False
+            with self.assertRaisesRegex(RuntimeError, "changed since backup"):
+                self.operations.update(self.root, "candidate", acceptance)
+            operation.assert_not_called()
+            docker.assert_not_called()
+
     def test_next_backup_template_and_container_share_same_immutable_image_reference(self):
         image = {"Id": "sha256:built", "RepoDigests": ["ghcr.io/example/image@sha256:published"], "Config": {}}
         for requested in ("example:latest", "ghcr.io/example/image@sha256:published"):
