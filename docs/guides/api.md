@@ -42,6 +42,14 @@ curl http://localhost:9621/workspaces/research/health \
 
 Set `LIGHTRAG_API_KEY` in your local shell to the same private value configured on the server. Do not paste a real key into documentation or an issue. For account authentication, use upstream `/login` and bearer-token behavior. The gateway's discovery list and UI bootstrap expose workspace identifiers, counts, and state before upstream authentication, and an API request may start a worker before upstream rejects its credentials. Put authentication in front of the whole origin for untrusted exposure; see the repository security policy.
 
+### Credentials for the Python helpers
+
+The client, batch, and check scripts can read `~/.config/lightrag/credentials.json` automatically. Store a JSON object with exactly two string fields: `origin` (your HTTP(S) origin, such as `http://localhost:9621`) and `api_key` (your private LightRAG key). The directory must have mode `0700`; the regular file must have mode `0600`. Both must be owned by the current user. Symlinks anywhere in the path and hard-linked files are rejected.
+
+The stored key is sent as `X-API-Key` only when the requested scheme, hostname, and effective port match its origin. A different `--base-url` receives no stored key; redirects are refused. Missing files leave unauthenticated behavior unchanged; malformed or unsafe files stop the helper before it sends a request. Errors never include credential contents.
+
+An explicit `LIGHTRAG_API_KEY` or `LIGHTRAG_BEARER_TOKEN` takes precedence over the file and retains its existing behavior for the selected destination. Keep the credential file private and outside the repository; never pass its contents as command arguments or print them in diagnostics.
+
 ## Upload and wait for indexing
 
 ```sh

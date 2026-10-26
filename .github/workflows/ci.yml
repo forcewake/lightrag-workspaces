@@ -69,6 +69,13 @@ jobs:
         run: python3 scripts/smoke_table_headers.py --engine docker --image lightrag-workspaces:ci
       - name: Verify real workers with disposable data and no network
         run: python3 scripts/smoke_container.py --engine docker --image lightrag-workspaces:ci
+      - name: Verify API-key authentication with isolated offline workspaces
+        run: |
+          mkdir auth-fixture
+          docker run --rm --network none --memory 4g --cpus 2 --pids-limit 512 \
+            --mount "type=bind,src=$PWD/auth-fixture,dst=/auth-fixture" \
+            --mount "type=bind,src=$PWD/scripts/smoke_api_key.py,dst=/checks/smoke_api_key.py,readonly" \
+            --entrypoint python lightrag-workspaces:ci /checks/smoke_api_key.py
       - name: Start an isolated PostgreSQL and VectorChord fixture
         run: |
           docker network create lightrag-postgres-ci

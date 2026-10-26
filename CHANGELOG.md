@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3 — 2026-10-26
+
+- Both interfaces remember one API key per server origin when switching workspaces. Existing histories and query settings remain workspace-scoped; clearing or rotating a key updates other open tabs.
+- The ingestion and retrieval client can load a private local credential file, restricted to its configured server origin. Explicit environment credentials retain precedence.
+- Offline image checks cover missing, incorrect and valid API keys, guest-token rejection, header/URL workspace routing and unchanged synthetic data.
+- Authentication documentation explains the upstream endpoint whitelist and the public discovery/UI boundary.
+
 ## 0.3.2 — 2026-10-25
 
 - The workspace selector now searches names, IDs and tags directly in its dropdown. Current and favorite workspaces are easy to find, with document counts, bounded scrolling and keyboard navigation in both interfaces.

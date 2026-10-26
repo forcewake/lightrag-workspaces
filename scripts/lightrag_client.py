@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 import urllib.error
@@ -23,6 +24,7 @@ ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 MODES = ("mix", "local", "global", "hybrid", "naive")
 STATUSES = ("pending", "parsing", "analyzing", "processing", "preprocessed", "processed", "failed")
 MAX_RESPONSE = 32 * 1024 * 1024
+MAX_CREDENTIAL_FILE = 16 * 1024
 
 
 class ClientError(Exception):
@@ -34,18 +36,86 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-class Client:
-    def __init__(self, base_url: str, timeout: float = 300):
-        parsed = urllib.parse.urlsplit(base_url)
+def origin_identity(value):
+    """Compare credential destinations by scheme, hostname and effective port."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
         if (parsed.scheme not in ("http", "https") or not parsed.hostname
                 or parsed.username is not None or parsed.password is not None
                 or parsed.query or parsed.fragment or parsed.path not in ("", "/")):
-            raise ClientError("Use an http(s) origin only, without credentials, path, query, or fragment.")
+            raise ValueError
+        port = parsed.port
+        return parsed.scheme, parsed.hostname.lower(), port if port is not None else (443 if parsed.scheme == "https" else 80)
+    except (ValueError, TypeError, AttributeError):
+        raise ClientError("Use an http(s) origin only, without credentials, path, query, or fragment.") from None
+
+
+def stored_api_key(base_url):
+    """Read an owner-private key only for its configured origin; never log it."""
+    path = Path.home() / ".config" / "lightrag" / "credentials.json"
+    directory_fd = file_fd = None
+    message = "Invalid local LightRAG credentials; check the JSON origin/api_key and private file permissions."
+    try:
+        try:
+            initial = path.lstat()
+        except FileNotFoundError:
+            return None
+        if path.resolve(strict=True) != path or not stat.S_ISREG(initial.st_mode):
+            raise ValueError
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory = os.fstat(directory_fd)
+        if stat.S_IMODE(directory.st_mode) != 0o700 or directory.st_uid != os.getuid():
+            raise ValueError
+        file_fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+        current = os.fstat(file_fd)
+        if (not stat.S_ISREG(current.st_mode) or stat.S_IMODE(current.st_mode) != 0o600
+                or current.st_uid != os.getuid() or current.st_nlink != 1
+                or (current.st_dev, current.st_ino) != (initial.st_dev, initial.st_ino)
+                or current.st_size > MAX_CREDENTIAL_FILE):
+            raise ValueError
+        with os.fdopen(file_fd, "rb") as stream:
+            file_fd = None
+            raw = stream.read(MAX_CREDENTIAL_FILE + 1)
+        if len(raw) > MAX_CREDENTIAL_FILE:
+            raise ValueError
+
+        def unique_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError
+                result[key] = value
+            return result
+
+        credentials = json.loads(raw, object_pairs_hook=unique_fields)
+        if not isinstance(credentials, dict) or set(credentials) != {"origin", "api_key"}:
+            raise ValueError
+        origin = origin_identity(credentials["origin"])
+        key = credentials["api_key"]
+        if not isinstance(key, str) or not 1 <= len(key) <= 4096 or any(not 33 <= ord(char) <= 126 for char in key):
+            raise ValueError
+        return key if origin == origin_identity(base_url) else None
+    except (OSError, ValueError, TypeError, ClientError):
+        raise ClientError(message) from None
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+class Client:
+    def __init__(self, base_url: str, timeout: float = 300):
+        origin_identity(base_url)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ClientError("Timeout must be a finite positive number.")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.headers = {"Accept": "application/json", "User-Agent": "lightrag-workspaces-client/0.3"}
+        if not os.environ.get("LIGHTRAG_API_KEY") and not os.environ.get("LIGHTRAG_BEARER_TOKEN"):
+            key = stored_api_key(base_url)
+            if key:
+                self.headers["X-API-Key"] = key
         for variable, header, prefix in (
             ("LIGHTRAG_API_KEY", "X-API-Key", ""),
             ("LIGHTRAG_BEARER_TOKEN", "Authorization", "Bearer "),
