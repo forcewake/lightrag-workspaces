@@ -195,11 +195,16 @@ def main():
                 process.wait(timeout=10)
                 RECEIPT['passed'] = False
                 RECEIPT['shutdown_error'] = 'isolated gateway exceeded graceful shutdown'
-        if process is not None and process.returncode != 0:
-            RECEIPT['passed'] = False
-            RECEIPT['shutdown_error'] = 'isolated gateway did not exit cleanly'
         if log is not None:
             log.close()
+        if process is not None:
+            # Uvicorn re-raises the captured SIGTERM after its lifespan shutdown.
+            # Require the completion marker as well as the expected exit code.
+            RECEIPT['gateway_exit_code'] = process.returncode
+            shutdown_complete = b'Application shutdown complete.' in (ROOT / 'gateway.log').read_bytes()
+            if process.returncode not in (0, -signal.SIGTERM) or not shutdown_complete:
+                RECEIPT['passed'] = False
+                RECEIPT['shutdown_error'] = 'isolated gateway did not shut down gracefully'
         RECEIPT['seconds'] = round(time.monotonic() - started, 2)
         RECEIPT['gateway_stopped'] = process is None or process.poll() is not None
         if owned_empty_fixture:
