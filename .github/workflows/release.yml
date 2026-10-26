@@ -72,6 +72,13 @@ jobs:
           docker pull tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
           python3 scripts/smoke_postgres_startup.py --engine docker --image "$IMAGE:$VERSION" \
             --postgres-image tensorchord/vchord-postgres:pg18-v1.1.1@sha256:2cfaf4ea4cf744dd53c750b82901fb1bc118a4e3b96ab5b499ce690b4f124cd8
+      - name: Verify API-key authentication with isolated offline workspaces
+        run: |
+          mkdir auth-fixture
+          docker run --rm --network none --memory 4g --cpus 2 --pids-limit 512 \
+            --mount "type=bind,src=$PWD/auth-fixture,dst=/auth-fixture" \
+            --mount "type=bind,src=$PWD/scripts/smoke_api_key.py,dst=/checks/smoke_api_key.py,readonly" \
+            --entrypoint python "${{ steps.metadata.outputs.image }}:${{ steps.metadata.outputs.version }}" /checks/smoke_api_key.py
       - name: Verify snapshot and independent restore under concurrent writes
         env:
           WORKSPACE_OPS_INTEGRATION: '1'

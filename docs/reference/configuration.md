@@ -124,6 +124,10 @@ Read [file processing](../guides/file-processing.md) before changing ingestion b
 
 `LIGHTRAG_API_KEY` configures upstream API-key authentication. `AUTH_ACCOUNTS`, `TOKEN_SECRET`, and related upstream JWT settings configure account authentication. Use fresh secrets and preserve them privately with the deployment.
 
+When enabling the key, also set `WHITELIST_PATHS=/health`. The upstream default includes `/api/*`, which otherwise leaves the Ollama-compatible endpoints exempt from API-key checks. Send the key in `X-API-Key` for protected requests, including workspace management. Liveness checks continue to use the public `/livez` endpoint.
+
+Both interfaces store a single API key for this browser origin, so switching workspaces does not require entering it again. Clearing or changing it updates other open tabs. Account tokens, conversation histories and query settings retain their existing scope. A different hostname, scheme or port is a different origin and needs its own key entry.
+
 The gateway does not implement per-workspace permissions or independently authenticate discovery and UI-shell responses. A worker can be cold-started before upstream rejects an unauthenticated API request. A shared authenticated instance is still one trust domain. For untrusted exposure, put authentication in front of the **whole origin**, including discovery and static UI, and retain network controls. Keep the localhost bind unless you have deliberately designed this access boundary.
 
 ## Apply changes
