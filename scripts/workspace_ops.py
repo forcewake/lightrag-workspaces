@@ -154,6 +154,35 @@ def disjoint(a, b):
     return a != b and a not in b.parents and b not in a.parents
 
 
+def retention_mount_references(container, directory):
+    """Protect direct mounts; exempt broad access only for proven stopped containers."""
+    directory = Path(directory).resolve()
+    state = container.get("State")
+    stopped = (isinstance(state, dict) and state.get("Status") in ("created", "exited")
+               and all(state.get(field) is False for field in ("Running", "Paused", "Restarting"))
+               and type(state.get("Pid")) is int and state["Pid"] == 0)
+    mounts = container.get("Mounts")
+    require(isinstance(mounts, list), "Container mounts must be a list")
+    for mount in mounts:
+        source = mount.get("Source") if isinstance(mount, dict) else None
+        if isinstance(mount, dict) and mount.get("Type") == "tmpfs":
+            destination = mount.get("Destination")
+            require(("Source" not in mount or source == "")
+                    and isinstance(destination, str) and destination.startswith("/")
+                    and "\0" not in destination, "Malformed tmpfs mount")
+            continue  # tmpfs has no host path that can reference a backup.
+        require(isinstance(source, str) and source.startswith("/") and "\0" not in source,
+                "Malformed container mount source")
+        source = Path(source).resolve()
+        # A stopped restore fixture may use the bundle itself or a subtree.
+        # Keep those references; only broad parent-directory access is exempt.
+        if source == directory or directory in source.parents:
+            return True
+        if source in directory.parents and not stopped:
+            return True
+    return False
+
+
 def canonical_mounts(mounts):
     """Ignore Docker's inspection order, preserving every mount field exactly."""
     require(isinstance(mounts, list), "Container mounts must be a list")
@@ -987,7 +1016,7 @@ print(json.dumps({"status":r.status,"headers":dict(r.headers),"body":r.read().de
                 containers = self.docker("ps", "-aq").decode().split()
                 if containers:
                     for container in json.loads(self.docker("inspect", *containers)):
-                        require(all(disjoint(mount["Source"], directory) for mount in container["Mounts"]),
+                        require(not retention_mount_references(container, directory),
                                 "A container still references this backup; retention will not remove it")
                 shutil.rmtree(directory)
         return {"apply": apply, "candidates": [str(path) for path in candidates],

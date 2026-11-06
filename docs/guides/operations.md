@@ -224,11 +224,15 @@ The Docker socket grants host-level control; this is a trusted administrator too
 
 Use the installed Unraid scheduling mechanism to run this wrapper daily at 03:00 in the operator's chosen host timezone (for example, `Europe/Amsterdam`). A host crontab entry is `0 3 * * * /absolute/private/backup-wrapper.sh`; installation/persistence depends on the Unraid mechanism already in use. Do not assume `CRON_TZ` support. Route exit status and private logs to the existing monitoring channel. A JSON schedule record can retain the wrapper path, image digest, host timezone, cron expression, retention count, last success, and last restore drill. Verify one actual run before enabling recurrence.
 
-Retention is opt-in and restricted to this tool's owned, verified `backup-*` bundles under `backup_root`. The newest N, all failed bundles, and every bundle referenced by a drill or update are protected. Referenced containers also block deletion. Legacy backups, private migration folders, and restore directories are never pruning targets. Preview first:
+Retention is opt-in and restricted to this tool's owned, verified `backup-*` bundles under `backup_root`. The newest N, all failed bundles, and every bundle referenced by a drill or update are protected. Legacy backups, private migration folders, and restore directories are never pruning targets. Preview first:
 
 ```bash
 python3 scripts/workspace_ops.py --config /srv/private/operations.json retention --keep 3
 ```
+
+The preview lists age/reference candidates; it does not verify their contents or check container mounts. With `--apply`, each candidate is verified and Docker mounts are inspected again immediately before deletion. A mount of the backup itself or anything inside it blocks deletion even when its container is stopped. A strict parent-directory mount (for example, a file manager mounting `/mnt`) is exempt only when Docker positively reports that container as stopped: `created` or `exited`, with no running, paused or restarting state and PID zero. Active or uncertain container states still block overlapping parent mounts. A blocked candidate stops the command; inspect the private error before retrying. Do not start or reconfigure containers concurrently with retention.
+
+This fix belongs to the host-side operations helper. Install the helper from an exact reviewed repository commit and refresh the helper revision/checksum in your private scheduler manifest and any wrapper checksum chain under the same operator lock. Preserve the previous helper and scheduler files for rollback, keep the application/database pins unchanged, and verify the scheduler preflight before running retention. No application image upgrade, database migration or service restart is required.
 
 ## Optional independent copy
 

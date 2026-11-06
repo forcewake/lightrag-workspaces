@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Backup retention no longer treats a broad parent-directory mount in a positively stopped container as a reference to every nested backup. Direct backup mounts, mounts inside a backup, and overlapping mounts in active or uncertain container states still block deletion. This host-side helper fix does not require an application or database restart.
+
 ## 0.3.3 — 2026-10-26
 
 - Both interfaces remember one API key per server origin when switching workspaces. Existing histories and query settings remain workspace-scoped; clearing or rotating a key updates other open tabs.

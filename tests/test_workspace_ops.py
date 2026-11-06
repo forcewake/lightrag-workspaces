@@ -431,6 +431,146 @@ class OperationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "at least one"):
             self.operations.retention(0, apply=True)
 
+    @staticmethod
+    def stopped_mount(source):
+        return {"State": {"Status": "exited", "Running": False, "Paused": False,
+                          "Restarting": False, "Pid": 0},
+                "Mounts": [{"Source": str(source)}]}
+
+    def retention_bundles(self, count=2):
+        directories = []
+        for number in range(1, count + 1):
+            directory = self.root / ("backup-" + str(number))
+            directory.mkdir(mode=0o700)
+            ops.save(directory / "operation.json", {"owner": ops.OWNER, "kind": "backup",
+                     "id": str(number), "created_at": str(number), "status": "verified"})
+            directories.append(directory)
+        return directories
+
+    def test_retention_removes_verified_old_backup_with_stopped_broad_parent_mount(self):
+        old, referenced, newest, failed = self.retention_bundles(4)
+        row = ops.load(failed / "operation.json")
+        ops.save(failed / "operation.json", row | {"status": "failed"})
+        drill = self.root / "drill-2"
+        drill.mkdir(mode=0o700)
+        ops.save(drill / "operation.json", {"owner": ops.OWNER, "kind": "drill", "backup_id": "2"})
+        unowned = self.root / "backup-unowned"
+        unowned.mkdir()
+        ops.save(unowned / "operation.json", {"owner": "other", "kind": "backup", "status": "verified"})
+        alias = self.root / "backup-alias"
+        alias.symlink_to(old, target_is_directory=True)
+        container = self.stopped_mount(self.root.parent)
+
+        with patch.object(self.operations, "verify_bundle") as verify, \
+                patch.object(self.operations, "docker", side_effect=[b"stopped\n", ops.canonical([container])]) as docker:
+            result = self.operations.retention(1, apply=True)
+        self.assertEqual(result["candidates"], [str(old)])
+        verify.assert_called_once_with(old)
+        self.assertEqual(docker.call_args_list[0].args, ("ps", "-aq"))
+        self.assertEqual(docker.call_args_list[1].args, ("inspect", "stopped"))
+        self.assertFalse(old.exists())
+        for directory in (referenced, newest, failed, unowned, drill):
+            self.assertTrue(directory.exists(), directory)
+        self.assertTrue(alias.is_symlink(), "Retention must not follow or remove a bundle alias")
+
+    def test_retention_protects_exact_and_child_mounts_even_when_stopped(self):
+        old, newest = self.retention_bundles()
+        for source in (old, old / "inputs"):
+            with self.subTest(source=source), patch.object(self.operations, "verify_bundle"), \
+                    patch.object(self.operations, "docker", side_effect=[
+                        b"fixture\n", ops.canonical([self.stopped_mount(source)])]):
+                with self.assertRaisesRegex(RuntimeError, "still references"):
+                    self.operations.retention(1, apply=True)
+            self.assertTrue(old.exists())
+            self.assertTrue(newest.exists())
+
+    def test_retention_broad_mount_requires_complete_stopped_state(self):
+        directory = self.root / "backup-example"
+        stopped = self.stopped_mount(self.root)
+        for status in ("created", "exited"):
+            container = copy.deepcopy(stopped)
+            container["State"]["Status"] = status
+            self.assertFalse(ops.retention_mount_references(container, directory))
+        states = [None, {}, {"Running": False}]
+        for change in ({"Status": "running", "Running": True, "Pid": 123},
+                       {"Status": "paused", "Paused": True}, {"Restarting": True},
+                       {"Status": "dead"}, {"Status": "removing"}, {"Status": "unknown"},
+                       {"Running": 0}, {"Paused": None}, {"Pid": False}, {"Pid": 123}):
+            states.append(stopped["State"] | change)
+        for field in stopped["State"]:
+            states.append({key: value for key, value in stopped["State"].items() if key != field})
+        for state in states:
+            with self.subTest(state=state):
+                self.assertTrue(ops.retention_mount_references(stopped | {"State": state}, directory))
+
+    def test_retention_resolves_mount_aliases_before_classifying_reference(self):
+        old, _ = self.retention_bundles()
+        alias = self.root / "mounted-alias"
+        alias.symlink_to(old, target_is_directory=True)
+        self.assertTrue(ops.retention_mount_references(self.stopped_mount(alias), old))
+        parent_alias = self.root / "parent-alias"
+        parent_alias.symlink_to(self.root, target_is_directory=True)
+        self.assertFalse(ops.retention_mount_references(self.stopped_mount(parent_alias), old))
+        active = self.stopped_mount(parent_alias)
+        active["State"].update(Status="running", Running=True, Pid=123)
+        self.assertTrue(ops.retention_mount_references(active, old))
+        self.assertFalse(ops.retention_mount_references({"Mounts": [{"Source": str(self.root / "backup-10")}]}, old))
+
+    def test_retention_rechecks_container_state_for_each_deletion(self):
+        oldest, old, newest = self.retention_bundles(3)
+        stopped = self.stopped_mount(self.root)
+        running = copy.deepcopy(stopped)
+        running["State"].update(Status="running", Running=True, Pid=123)
+        with patch.object(self.operations, "verify_bundle") as verify, \
+                patch.object(self.operations, "docker", side_effect=[
+                    b"browser\n", ops.canonical([stopped]), b"browser\n", ops.canonical([running])]):
+            with self.assertRaisesRegex(RuntimeError, "still references"):
+                self.operations.retention(1, apply=True)
+        self.assertEqual([call.args[0] for call in verify.call_args_list], [old, oldest])
+        self.assertFalse(old.exists())
+        self.assertTrue(oldest.exists())
+        self.assertTrue(newest.exists())
+
+    def test_retention_verification_and_inspection_failures_prevent_deletion(self):
+        old, newest = self.retention_bundles()
+        with patch.object(self.operations, "verify_bundle", side_effect=RuntimeError("invalid bundle")), \
+                patch.object(self.operations, "docker") as docker:
+            with self.assertRaisesRegex(RuntimeError, "invalid bundle"):
+                self.operations.retention(1, apply=True)
+            docker.assert_not_called()
+        with patch.object(self.operations, "verify_bundle"), \
+                patch.object(self.operations, "docker", side_effect=[b"browser\n", RuntimeError("inspect failed")]):
+            with self.assertRaisesRegex(RuntimeError, "inspect failed"):
+                self.operations.retention(1, apply=True)
+        self.assertTrue(old.exists())
+        self.assertTrue(newest.exists())
+
+    def test_retention_rejects_malformed_mount_sources(self):
+        directory = self.root / "backup-example"
+        for kind in (None, "bind", "volume", "unknown"):
+            for source in (None, "", "relative", 123, "/invalid\0path"):
+                with self.subTest(kind=kind, source=source), self.assertRaisesRegex(RuntimeError, "mount source"):
+                    ops.retention_mount_references({"Mounts": [{"Type": kind, "Source": source}]}, directory)
+            with self.subTest(kind=kind, missing_source=True), self.assertRaisesRegex(RuntimeError, "mount source"):
+                ops.retention_mount_references({"Mounts": [{"Type": kind}]}, directory)
+        for mounts in (None, {}, [None]):
+            with self.subTest(mounts=mounts), self.assertRaisesRegex(RuntimeError, "mount"):
+                ops.retention_mount_references({"Mounts": mounts}, directory)
+
+    def test_retention_accepts_hostless_tmpfs_without_ignoring_other_mounts(self):
+        directory = self.root / "backup-example"
+        tmpfs = {"Type": "tmpfs", "Source": "", "Destination": "/tmp", "Mode": "",
+                 "RW": True, "Propagation": ""}
+        for mount in (tmpfs, {key: value for key, value in tmpfs.items() if key != "Source"}):
+            with self.subTest(mount=mount):
+                self.assertFalse(ops.retention_mount_references({"Mounts": [mount]}, directory))
+                self.assertTrue(ops.retention_mount_references({"Mounts": [mount,
+                    {"Type": "bind", "Source": str(directory), "Destination": "/backup"}]}, directory))
+        for change in ({"Source": None}, {"Source": str(directory)}, {"Source": 123},
+                       {"Destination": None}, {"Destination": "relative"}, {"Destination": "/bad\0path"}):
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "tmpfs mount"):
+                ops.retention_mount_references({"Mounts": [tmpfs | change]}, directory)
+
     def test_unowned_bundle_and_checksum_traversal_rejected(self):
         directory = self.root / "bundle"
         directory.mkdir(mode=0o700)
